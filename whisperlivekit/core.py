@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from argparse import Namespace
 from dataclasses import asdict
 
@@ -10,6 +11,7 @@ from whisperlivekit.simul_whisper import SimulStreamingASR
 from whisperlivekit.timed_objects import ASRToken, TimedText
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 _NLLW_LANGUAGE_ALIASES = {
@@ -101,6 +103,9 @@ class TranscriptionEngine:
         self.tokenizer = None
         self.diarization = None
         self.vac_session = None
+        self._lifecycle_lock = threading.RLock()
+        self._active_sessions = 0
+        self._auto_unload_timer = None
 
         if config.vac:
             from whisperlivekit.silero_vad_iterator import is_onnx_available
@@ -327,6 +332,116 @@ class TranscriptionEngine:
                     nllb_backend=config.nllb_backend,
                     nllb_size=config.nllb_size,
                 )
+
+    def register_session(self):
+        with self._lifecycle_lock:
+            self._cancel_auto_unload_timer_locked()
+            self._active_sessions += 1
+
+    def unregister_session(self):
+        with self._lifecycle_lock:
+            self._active_sessions = max(0, self._active_sessions - 1)
+            if self._active_sessions == 0:
+                self._schedule_auto_unload_locked()
+
+    @property
+    def active_sessions(self) -> int:
+        with self._lifecycle_lock:
+            return self._active_sessions
+
+    def ensure_model_loaded(self):
+        if not self.asr:
+            return {"loaded": False, "reason": "transcription_disabled"}
+        with self._lifecycle_lock:
+            before = self.model_status()
+            if hasattr(self.asr, "ensure_model_loaded"):
+                started = time.perf_counter()
+                self.asr.ensure_model_loaded()
+                elapsed = time.perf_counter() - started
+                after = self.model_status()
+                if not before.get("loaded") and after.get("loaded"):
+                    logger.info(
+                        "ASR model is ready after reload in %.2fs (backend=%s)",
+                        elapsed,
+                        after.get("backend"),
+                    )
+            return self.model_status()
+
+    def unload_model(self, force: bool = False):
+        if not self.asr:
+            return {
+                "unloaded": False,
+                "reason": "transcription_disabled",
+                "active_sessions": self.active_sessions,
+            }
+        with self._lifecycle_lock:
+            if self._active_sessions and not force:
+                return {
+                    "unloaded": False,
+                    "reason": "active_sessions",
+                    "active_sessions": self._active_sessions,
+                }
+            if not hasattr(self.asr, "unload_model"):
+                return {
+                    "unloaded": False,
+                    "reason": "backend_does_not_support_unload",
+                    "backend": self.config.backend,
+                    "active_sessions": self._active_sessions,
+                }
+            self._cancel_auto_unload_timer_locked()
+            unload_info = self.asr.unload_model()
+            return {
+                "unloaded": True,
+                "backend": self.config.backend,
+                "active_sessions": self._active_sessions,
+                **unload_info,
+            }
+
+    def model_status(self):
+        status = {}
+        if self.asr and hasattr(self.asr, "model_status"):
+            status = self.asr.model_status()
+        elif self.asr:
+            status = {"loaded": True, "unloaded": False}
+        else:
+            status = {"loaded": False, "unloaded": False}
+        return {
+            "backend": self.config.backend,
+            "active_sessions": self.active_sessions,
+            "auto_unload_timeout_seconds": getattr(self.config, "model_auto_unload_timeout_seconds", 30.0),
+            **status,
+        }
+
+    def _cancel_auto_unload_timer_locked(self):
+        if self._auto_unload_timer is not None:
+            self._auto_unload_timer.cancel()
+            self._auto_unload_timer = None
+
+    def _schedule_auto_unload_locked(self):
+        timeout = max(0.0, float(getattr(self.config, "model_auto_unload_timeout_seconds", 30.0)))
+        if timeout <= 0.0:
+            return
+        self._cancel_auto_unload_timer_locked()
+        timer = threading.Timer(timeout, self._auto_unload_if_idle)
+        timer.daemon = True
+        self._auto_unload_timer = timer
+        timer.start()
+        logger.info("Scheduled ASR model auto-unload in %.1fs", timeout)
+
+    def _auto_unload_if_idle(self):
+        with self._lifecycle_lock:
+            self._auto_unload_timer = None
+            if self._active_sessions:
+                return
+        result = self.unload_model()
+        if result.get("unloaded"):
+            logger.info(
+                "Auto-unloaded ASR model after %.1fs idle",
+                getattr(self.config, "model_auto_unload_timeout_seconds", 30.0),
+            )
+        else:
+            logger.info("Skipped ASR auto-unload: %s", result.get("reason"))
+
 
 def _to_wlk_token(tok):
     """Convert a qwen3_asr_causal token into WhisperLiveKit's ASRToken.

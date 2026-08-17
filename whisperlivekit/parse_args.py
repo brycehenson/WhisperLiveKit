@@ -1,5 +1,12 @@
-
+import os
 from argparse import ArgumentParser, BooleanOptionalAction
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def parse_args():
@@ -245,6 +252,20 @@ def parse_args():
         default="auto",
         choices=["auto", "mlx-whisper", "faster-whisper", "whisper", "openai-api", "funasr", "voxtral", "voxtral-mlx", "qwen3-vllm", "qwen3-vllm-metal", "qwen3-streaming", "canary"],
         help="Select the ASR backend implementation. Use 'funasr' for SenseVoiceSmall through LocalAgreement (zh/yue/en/ja/ko or auto). Use 'qwen3-vllm' for Qwen3-ASR through in-process vLLM with ForcedAligner on GPU. Use 'qwen3-vllm-metal' for Qwen3-ASR through vllm-metal in-process STT on Apple Silicon. Use 'qwen3-streaming' for Qwen3-ASR through plain HF Transformers with a bounded-recompute audio cache (CUDA/MPS/CPU, no vLLM; requires an explicit --language). Use 'canary' for NVIDIA Canary through NeMo on CUDA or CPU with LocalAgreement.",
+    )
+    parser.add_argument(
+        "--allow-dev-unload",
+        action="store_true",
+        default=_env_bool("ALLOW_DEV_UNLOAD"),
+        dest="allow_dev_unload",
+        help="Enable POST /dev/unload to release ASR model memory. Also enabled by ALLOW_DEV_UNLOAD=true.",
+    )
+    parser.add_argument(
+        "--model-auto-unload-timeout-seconds",
+        type=float,
+        default=float(os.getenv("MODEL_AUTO_UNLOAD_TIMEOUT_SECONDS", "30")),
+        dest="model_auto_unload_timeout_seconds",
+        help="Idle seconds after the last session before auto-unloading the ASR model. Set to 0 to disable auto-unload.",
     )
     parser.add_argument(
         "--no-vac",

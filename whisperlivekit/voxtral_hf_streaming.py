@@ -34,6 +34,8 @@ class VoxtralHFStreamingASR:
 
         self.logfile = logfile
         self.transcribe_kargs = {}
+        self._model_lock = threading.RLock()
+        self._model_unloaded = False
 
         lan = kwargs.get("lan", "auto")
         self.original_language = None if lan == "auto" else lan
@@ -46,15 +48,12 @@ class VoxtralHFStreamingASR:
                 model_path = model_size
             else:
                 model_path = DEFAULT_MODEL
+        self.model_path = model_path
 
         t = time.time()
         logger.info(f"Loading Voxtral model '{model_path}' via HF Transformers...")
         self.processor = AutoProcessor.from_pretrained(model_path)
-        self.model = VoxtralRealtimeForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-        )
+        self.model = self._load_model()
         logger.info(f"Voxtral HF model loaded in {time.time() - t:.2f}s on {self.model.device}")
 
         self.backend_choice = "voxtral"
@@ -62,6 +61,49 @@ class VoxtralHFStreamingASR:
 
     def transcribe(self, audio):
         pass
+
+    def _load_model(self):
+        import torch
+        from transformers import VoxtralRealtimeForConditionalGeneration
+
+        return VoxtralRealtimeForConditionalGeneration.from_pretrained(
+            self.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+
+    def ensure_model_loaded(self):
+        with self._model_lock:
+            if self.model is None:
+                t = time.time()
+                self.model = self._load_model()
+                self._model_unloaded = False
+                logger.info(
+                    "Reloaded Voxtral HF model from %s in %.2fs on %s",
+                    self._reload_source_description(),
+                    time.time() - t,
+                    self.model.device,
+                )
+        return self.model
+
+    def unload_model(self):
+        from whisperlivekit.local_agreement.backends import _clear_accelerator_memory
+
+        with self._model_lock:
+            was_loaded = self.model is not None
+            self.model = None
+            self._model_unloaded = True
+        _clear_accelerator_memory()
+        return {"loaded_before": was_loaded}
+
+    def model_status(self):
+        return {
+            "loaded": self.model is not None,
+            "unloaded": self._model_unloaded,
+        }
+
+    def _reload_source_description(self):
+        return "local/Hugging Face model cache"
 
 
 class VoxtralHFStreamingOnlineProcessor:

@@ -1,7 +1,10 @@
 import io
+import gc
 import logging
 import math
 import sys
+import threading
+import time
 from typing import List
 
 import numpy as np
@@ -20,6 +23,9 @@ class ASRBase:
         self.logfile = logfile
         self.transcribe_kargs = {}
         self.lora_path = lora_path
+        self._model_args = (model_size, cache_dir, model_dir)
+        self._model_lock = threading.RLock()
+        self._model_unloaded = False
         if lan == "auto":
             self.original_language = None
         else:
@@ -34,6 +40,58 @@ class ASRBase:
 
     def use_vad(self):
         raise NotImplementedError("must be implemented in the child class")
+
+    def ensure_model_loaded(self):
+        with self._model_lock:
+            if self.model is None:
+                started = time.perf_counter()
+                self.model = self.load_model(*self._model_args)
+                elapsed = time.perf_counter() - started
+                logger.info(
+                    "Reloaded %s model from %s in %.2fs",
+                    self.__class__.__name__,
+                    self._reload_source_description(),
+                    elapsed,
+                )
+                self._model_unloaded = False
+        return self.model
+
+    def unload_model(self):
+        with self._model_lock:
+            was_loaded = self.model is not None
+            self.model = None
+            self._model_unloaded = True
+        _clear_accelerator_memory()
+        return {"loaded_before": was_loaded}
+
+    def model_status(self):
+        return {
+            "loaded": self.model is not None,
+            "unloaded": self._model_unloaded,
+        }
+
+    def _reload_source_description(self):
+        return "local model files/cache"
+
+
+def _clear_accelerator_memory():
+    gc.collect()
+    try:
+        import torch
+    except Exception:
+        torch = None
+    if torch is not None:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
 
 
 class WhisperASR(ASRBase):
@@ -60,6 +118,7 @@ class WhisperASR(ASRBase):
         return load_whisper_model(model_size, download_root=cache_dir, lora_path=self.lora_path)
 
     def transcribe(self, audio, init_prompt=""):
+        self.ensure_model_loaded()
         options = dict(self.transcribe_kargs)
         options.pop("vad", None)
         options.pop("vad_filter", None)
@@ -110,13 +169,18 @@ class FasterWhisperASR(ASRBase):
             logger.debug(f"Loading faster-whisper model from {resolved_path}. "
                          f"model_size and cache_dir parameters are not used.")
             model_size_or_path = str(resolved_path)
+            self._resolved_model_path = resolved_path
         elif model_size is not None:
             model_size_or_path = model_size
+            self._resolved_model_path = None
         else:
             raise ValueError("Either model_size or model_dir must be set")
+        self._model_size_or_path = model_size_or_path
+        self._cache_dir = cache_dir
         device = "auto" # Allow CTranslate2 to decide available device
-        compute_type = "auto" # Allow CTranslate2 to decide faster compute type
-
+        # set here for qantization when running local_agreement
+        # int8_float16 auto
+        compute_type = "int8_float16" # Allow CTranslate2 to decide faster compute type
 
         model = WhisperModel(
             model_size_or_path,
@@ -126,7 +190,22 @@ class FasterWhisperASR(ASRBase):
         )
         return model
 
+    def unload_model(self):
+        with self._model_lock:
+            was_loaded = self.model is not None
+            self.model = None
+            self._model_unloaded = True
+        _clear_accelerator_memory()
+        return {"loaded_before": was_loaded}
+
+    def model_status(self):
+        return {
+            "loaded": self.model is not None,
+            "unloaded": self._model_unloaded,
+        }
+
     def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list:
+        self.ensure_model_loaded()
         segments, info = self.model.transcribe(
             audio,
             language=self.original_language,
