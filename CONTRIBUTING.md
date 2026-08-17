@@ -1,46 +1,70 @@
 # Contributing
 
-Thank you for considering contributing ! We appreciate your time and effort to help make this project better.
+Thanks for helping improve WhisperLiveKit. Bug fixes, documentation, tests, and focused features are welcome.
 
-## Before You Start
+Participation in the project is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-1. **Search for Existing Issues or Discussions:**
-   - Before opening a new issue or discussion, please check if there's already an existing one related to your topic. This helps avoid duplicates and keeps discussions centralized.
+## Before opening an issue
 
-2. **Discuss Your Contribution:**
-   - If you plan to make a significant change, it's advisable to discuss it in an issue first. This ensures that your contribution aligns with the project's goals and avoids duplicated efforts.
+Search the existing issues and discussions first. Use an issue for reproducible bugs and concrete feature requests. Use a discussion for setup questions, usage help, and broader ideas.
 
-3. **General questions about whisper streaming web:**
-   - For general questions about whisper streaming web, use the discussion space on GitHub. This helps in fostering a collaborative environment and encourages knowledge-sharing.
+A useful bug report includes:
 
-## Opening Issues
+- the exact command or Python configuration;
+- the backend, model, operating system, Python version, and accelerator;
+- the expected and observed behavior;
+- the complete traceback or relevant logs;
+- a minimal audio sample or reproduction when licensing permits it.
 
-If you encounter a problem with WhisperLiveKit or want to suggest an improvement, please follow these guidelines when opening an issue:
+Security reports should follow [SECURITY.md](SECURITY.md) and must not be filed as public issues.
 
-- **Bug Reports:**
-  - Clearly describe the error. **Please indicate the parameters you use, especially the model(s)**
-  - Provide a minimal, reproducible example that demonstrates the issue.
+## Development setup
 
-- **Feature Requests:**
-  - Clearly outline the new feature you are proposing.
-  - Explain how it would benefit the project.
+Clone the repository with its submodule, then install the development and test dependencies:
 
-## Opening Pull Requests
+```bash
+git clone --recurse-submodules https://github.com/QuentinFuxa/WhisperLiveKit.git
+cd WhisperLiveKit
+uv sync --extra test
+```
 
-We welcome and appreciate contributions! To ensure a smooth review process, please follow these guidelines when opening a pull request:
+If the repository was cloned without submodules, initialize them before running `uv sync`:
 
-- **Commit Messages:**
-  - Write clear and concise commit messages, explaining the purpose of each change.
+```bash
+git submodule update --init --recursive
+```
 
-- **Documentation:**
-  - Update documentation when introducing new features or making changes that impact existing functionality.
+WhisperLiveKit supports Python 3.11 through 3.13. Python 3.12 is the primary local and CI development version.
 
-- **Tests:**
-  - If applicable, add or update tests to cover your changes.
+## Validation
 
-- **Discuss Before Major Changes:**
-  - If your PR includes significant changes, discuss it in an issue first.
+Run the dependency-light suite and static checks before submitting a pull request:
 
-## Thank You
+```bash
+uv run ruff check .
+uv lock --check
+uv run pytest -q tests/ --ignore=tests/test_pipeline.py
+```
 
-Your contributions make WhisperLiveKit better for everyone. Thank you for your time and dedication!
+Changes to streaming, buffering, timestamps, model loading, or silence handling should also run the real-model pipeline tests that cover the affected backend:
+
+```bash
+uv run pytest -v tests/test_pipeline.py -k whisper
+```
+
+These tests download models and audio, so record the backend, hardware, selected tests, and results in the pull request. Add a focused regression test for every bug fix.
+
+## Pull requests
+
+Keep each pull request focused on one problem. For a large behavior change, open or join an issue first so the approach can be agreed before substantial implementation work.
+
+Pull requests should:
+
+- explain the user-visible impact and any compatibility risk;
+- update documentation and examples when behavior changes;
+- include the commands and results used for validation;
+- keep generated files and unrelated formatting changes out of the diff;
+- preserve the existing public API unless the change is explicitly discussed;
+- use clear commit messages without generated attribution trailers.
+
+Maintainers may ask for a smaller diff, additional tests, benchmark evidence, or a rebase onto `main` before merging.

@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import List
+from typing import Any, List
 
 import numpy as np
 import torch
@@ -29,6 +29,63 @@ if faster_backend_available():
     from faster_whisper.feature_extractor import FeatureExtractor
 
 USE_MLCORE = False
+
+
+def _as_float32_array(value: Any) -> np.ndarray:
+    """Convert CTranslate2 encoder output, including StorageView, to float32."""
+    if isinstance(value, np.ndarray):
+        if value.dtype == np.object_:
+            return _stack_object_array(value)
+        return value.astype(np.float32, copy=False)
+
+    if isinstance(value, (list, tuple)):
+        arrays = [_as_float32_array(item) for item in value]
+        if not arrays:
+            return np.array([], dtype=np.float32)
+        if len(arrays) == 1:
+            return arrays[0]
+        return np.stack(arrays).astype(np.float32, copy=False)
+
+    try:
+        arr = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError):
+        to_device = getattr(value, "to_device", None)
+        if callable(to_device):
+            try:
+                arr = np.asarray(to_device("cpu"), dtype=np.float32)
+            except (TypeError, ValueError):
+                arr = np.asarray(value, dtype=object)
+        else:
+            arr = np.asarray(value, dtype=object)
+
+    if arr.dtype == np.object_:
+        return _stack_object_array(arr)
+    return arr.astype(np.float32, copy=False)
+
+
+def _stack_object_array(arr: np.ndarray) -> np.ndarray:
+    """Stack object arrays that contain nested array-like values."""
+    arrays = [_as_float32_array(item) for item in arr.flat]
+    if not arrays:
+        return np.array([], dtype=np.float32)
+
+    first_shape = arrays[0].shape
+    if all(item.shape == first_shape for item in arrays):
+        return np.stack(arrays).reshape(arr.shape + first_shape)
+
+    return np.array(arrays, dtype=np.float32)
+
+
+def _encoder_features_to_tensor(value: Any, device: str) -> torch.Tensor:
+    """Convert faster-whisper encoder features to a Torch tensor."""
+    try:
+        tensor = torch.as_tensor(value, device=device)
+        if tensor.dtype.is_floating_point:
+            return tensor
+        return tensor.float()
+    except (RuntimeError, TypeError, ValueError):
+        arr = _as_float32_array(value)
+        return torch.as_tensor(arr, device=device)
 
 
 def load_coreml_encoder():
@@ -201,6 +258,9 @@ class AlignAtt(AlignAttBase):
             return True
         if self.state.never_fire:
             return False
+        if self.state.CIFLinear is None:
+            logger.warning("CIF end-of-word detection requested but no CIF model is loaded")
+            return False
         return fire_at_boundary(chunked_encoder_feature, self.state.CIFLinear)
 
     @torch.no_grad()
@@ -262,7 +322,12 @@ class AlignAtt(AlignAttBase):
             )
             mlx_mel = mlx_pad_or_trim(mlx_mel_padded, N_FRAMES, axis=-2)
             mlx_encoder_feature = self.mlx_encoder.encoder(mlx_mel[None])
-            encoder_feature = torch.as_tensor(mlx_encoder_feature)
+            # torch>=2.13 converts MLX arrays via DLPack onto MPS, but the
+            # decoder weights live on self.device: pin the device explicitly,
+            # like the CoreML branch above.
+            encoder_feature = torch.as_tensor(
+                np.asarray(mlx_encoder_feature), device=self.device,
+            )
             content_mel_len = int((mlx_mel_padded.shape[0] - mlx_mel.shape[0]) / 2)
         elif self.fw_encoder:
             audio_length_seconds = len(input_segments) / 16000
@@ -272,26 +337,10 @@ class AlignAtt(AlignAttBase):
             )[None, :]
             mel = fw_pad_or_trim(mel_padded_2, N_FRAMES, axis=-1)
             encoder_feature_ctranslate = self.fw_encoder.encode(mel)
-            if self.device == 'cpu':
-                encoder_feature_ctranslate = np.array(encoder_feature_ctranslate)
-            try:
-                encoder_feature = torch.as_tensor(encoder_feature_ctranslate, device=self.device)
-            except TypeError:
-                try:
-                    arr = np.asarray(encoder_feature_ctranslate, dtype=np.float32)
-                except (TypeError, ValueError):
-                    arr = np.array(encoder_feature_ctranslate)
-                    if arr.dtype == np.object_:
-                        try:
-                            arr = np.stack([
-                                np.asarray(item, dtype=np.float32) for item in arr.flat
-                            ])
-                        except (TypeError, ValueError):
-                            arr = np.array(
-                                [[float(x) for x in row] for row in arr.flat],
-                                dtype=np.float32,
-                            )
-                encoder_feature = torch.as_tensor(arr, device=self.device)
+            encoder_feature = _encoder_features_to_tensor(
+                encoder_feature_ctranslate,
+                self.device,
+            )
         else:
             mel_padded = log_mel_spectrogram(
                 input_segments, n_mels=self.model.dims.n_mels,

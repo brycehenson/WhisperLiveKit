@@ -1,22 +1,43 @@
 import asyncio
+import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from whisperlivekit import AudioProcessor, TranscriptionEngine, get_inline_ui_html, parse_args
+from whisperlivekit.api_auth import websocket_token
+from whisperlivekit.config import parse_cors_origins
+from whisperlivekit.timed_objects import FrontData
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.getLogger().setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-logging.getLogger("whisperlivekit.qwen3_asr").setLevel(logging.DEBUG)
 
 config = parse_args()
 transcription_engine = None
+
+_API_TOKEN = getattr(config, "api_token", None) or os.environ.get("WLK_API_TOKEN") or None
+
+
+def _token_ok(candidate: Optional[str]) -> bool:
+    """No token configured = open server; otherwise constant-time compare."""
+    if _API_TOKEN is None:
+        return True
+    return bool(candidate) and hmac.compare_digest(candidate, _API_TOKEN)
+
+
+def _bearer_token(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,7 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=parse_cors_origins(config.cors_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -71,18 +92,41 @@ async def handle_websocket_results(websocket, results_generator, diff_tracker=No
 async def websocket_endpoint(websocket: WebSocket):
     global transcription_engine
 
+    # Authentication (when --api-token / WLK_API_TOKEN is set): accept the
+    # token either as a query parameter or an Authorization: Bearer header.
+    ws_token = websocket_token(websocket)
+    if not _token_ok(ws_token):
+        await websocket.close(code=4401, reason="invalid or missing API token")
+        logger.warning("WebSocket rejected: invalid or missing API token")
+        return
+
     # Read per-session options from query parameters
     session_language = websocket.query_params.get("language", None)
     mode = websocket.query_params.get("mode", "full")
+    session_target_language = websocket.query_params.get("target_language", None)
 
-    audio_processor = AudioProcessor(
-        transcription_engine=transcription_engine,
-        language=session_language,
-    )
+    try:
+        audio_processor = AudioProcessor(
+            transcription_engine=transcription_engine,
+            language=session_language,
+            mode=mode,
+            target_language=session_target_language,
+        )
+    except ValueError as e:
+        # Bad per-session parameters (e.g. a language the backend does not
+        # support): tell the client instead of failing before the handshake.
+        await websocket.accept()
+        try:
+            await websocket.send_json({"type": "error", "error": str(e)})
+        finally:
+            await websocket.close(code=4400, reason="invalid session parameters")
+        logger.warning("WebSocket rejected: %s", e)
+        return
     await websocket.accept()
     logger.info(
-        "WebSocket connection opened.%s",
+        "WebSocket connection opened.%s%s",
         f" language={session_language}" if session_language else "",
+        f" target_language={session_target_language}" if session_target_language else "",
     )
     diff_tracker = None
     if mode == "diff":
@@ -134,6 +178,10 @@ async def websocket_endpoint(websocket: WebSocket):
 async def deepgram_websocket_endpoint(websocket: WebSocket):
     """Deepgram-compatible live transcription WebSocket."""
     global transcription_engine
+    if not _token_ok(websocket_token(websocket)):
+        await websocket.close(code=4401, reason="invalid or missing API token")
+        logger.warning("Deepgram WebSocket rejected: invalid or missing API token")
+        return
     from whisperlivekit.deepgram_compat import handle_deepgram_websocket
     await handle_deepgram_websocket(websocket, transcription_engine, config)
 
@@ -141,6 +189,19 @@ async def deepgram_websocket_endpoint(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 # OpenAI-compatible REST API  (/v1/audio/transcriptions)
 # ---------------------------------------------------------------------------
+
+_DIARIZED_JSON_REQUIRES_DIARIZATION = (
+    "response_format=diarized_json requires diarization to be enabled on the "
+    "server. Start the server with --diarization."
+)
+_OPENAI_RESPONSE_FORMATS = frozenset({
+    "json",
+    "verbose_json",
+    "diarized_json",
+    "text",
+    "srt",
+    "vtt",
+})
 
 async def _convert_to_pcm(audio_bytes: bytes) -> bytes:
     """Convert any audio format to PCM s16le mono 16kHz using ffmpeg."""
@@ -171,7 +232,37 @@ def _parse_time_str(time_str: str) -> float:
     return float(parts[0])
 
 
-def _format_openai_response(front_data, response_format: str, language: Optional[str], duration: float) -> dict:
+def _speaker_label_from_index(index: int) -> str:
+    """Return A, B, ..., Z, AA, AB, ... for a zero-based speaker index."""
+    label = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        label = chr(ord("A") + remainder) + label
+    return label
+
+
+def _speaker_label(speaker, speaker_labels: dict) -> str:
+    """Map internal speaker IDs to OpenAI-style speaker labels."""
+    # Diarized WLK lines use 1-based numeric speaker IDs, while OpenAI's
+    # diarized response examples use stable alphabetic labels.
+    if isinstance(speaker, int) and speaker > 0:
+        return _speaker_label_from_index(speaker - 1)
+    if speaker not in speaker_labels:
+        # Non-numeric speaker IDs can come from other diarization backends, so
+        # keep a deterministic first-seen mapping for those labels.
+        speaker_labels[speaker] = _speaker_label_from_index(len(speaker_labels))
+    return speaker_labels[speaker]
+
+
+def _duration_usage(duration: float) -> dict:
+    return {
+        "type": "duration",
+        "seconds": round(duration),
+    }
+
+
+def _format_openai_response(front_data, response_format: str, language: Optional[str], duration: float, diarization_enabled: bool = True) -> dict:
     """Convert FrontData to OpenAI-compatible response."""
     d = front_data.to_dict()
     lines = d.get("lines", [])
@@ -183,30 +274,97 @@ def _format_openai_response(front_data, response_format: str, language: Optional
     if response_format == "text":
         return full_text
 
+    speaker_labels = {}
+
+    if response_format == "diarized_json":
+        if not diarization_enabled:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=400,
+                detail=_DIARIZED_JSON_REQUIRES_DIARIZATION,
+            )
+        segments = []
+        text_parts = []
+        for line in lines:
+            # WLK represents silence as speaker -2; diarized_json only emits
+            # spoken transcript segments with actual text.
+            if line.get("speaker") == -2 or not line.get("text"):
+                continue
+            speaker = _speaker_label(line.get("speaker", 1), speaker_labels)
+            start = _parse_time_str(line.get("start", "0:00:00"))
+            end = _parse_time_str(line.get("end", "0:00:00"))
+            text = line["text"]
+            segments.append({
+                "type": "transcript.text.segment",
+                "id": f"seg_{len(segments) + 1:03d}",
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "text": text,
+                "speaker": speaker,
+            })
+            # Match the diarized_json top-level transcript style by preserving
+            # speaker turns in the combined text instead of flattening them.
+            text_parts.append(f"{speaker}: {text}")
+
+        return {
+            "task": "transcribe",
+            "duration": round(duration, 2),
+            "text": "\n".join(text_parts).strip(),
+            "segments": segments,
+            "usage": _duration_usage(duration),
+        }
+
     # Build segments and words for verbose_json
     segments = []
     words = []
-    for i, line in enumerate(lines):
-        if line.get("speaker") == -2 or not line.get("text"):
-            continue
-        start = _parse_time_str(line.get("start", "0:00:00"))
-        end = _parse_time_str(line.get("end", "0:00:00"))
+
+    # Prefer real Segment objects (carrying ASRToken timestamps) when available;
+    # fall back to the serialized dict form (e.g. test mocks without .lines).
+    real_segments = getattr(front_data, "lines", None)
+    if real_segments is not None:
+        seg_iter = [
+            (s.start, s.end, s.text, getattr(s, "tokens", None))
+            for s in real_segments
+            if s.speaker != -2 and s.text
+        ]
+    else:
+        seg_iter = [
+            (
+                _parse_time_str(line.get("start", "0:00:00")),
+                _parse_time_str(line.get("end", "0:00:00")),
+                line["text"],
+                None,
+            )
+            for line in lines
+            if line.get("speaker") != -2 and line.get("text")
+        ]
+
+    for start, end, text, real_tokens in seg_iter:
         segments.append({
             "id": len(segments),
             "start": round(start, 2),
             "end": round(end, 2),
-            "text": line["text"],
+            "text": text,
         })
-        # Split segment text into approximate words with estimated timestamps
-        seg_words = line["text"].split()
-        if seg_words:
-            word_duration = (end - start) / max(len(seg_words), 1)
-            for j, word in enumerate(seg_words):
-                words.append({
-                    "word": word,
-                    "start": round(start + j * word_duration, 2),
-                    "end": round(start + (j + 1) * word_duration, 2),
-                })
+        if real_tokens:
+            for tok in real_tokens:
+                if tok.text and tok.text.strip():
+                    words.append({
+                        "word": tok.text.strip(),
+                        "start": round(tok.start, 2),
+                        "end": round(tok.end, 2),
+                    })
+        else:
+            # Fallback: interpolate word timestamps from segment boundaries
+            seg_words = text.split()
+            if seg_words:
+                word_duration = (end - start) / max(len(seg_words), 1)
+                for j, word in enumerate(seg_words):
+                    words.append({
+                        "word": word,
+                        "start": round(start + j * word_duration, 2),
+                        "end": round(start + (j + 1) * word_duration, 2),
+                    })
 
     if response_format == "verbose_json":
         return {
@@ -216,6 +374,7 @@ def _format_openai_response(front_data, response_format: str, language: Optional
             "text": full_text,
             "words": words,
             "segments": segments,
+            "usage": _duration_usage(duration),
         }
 
     if response_format in ("srt", "vtt"):
@@ -233,7 +392,10 @@ def _format_openai_response(front_data, response_format: str, language: Optional
         return "\n".join(lines_out)
 
     # Default: json
-    return {"text": full_text}
+    return {
+        "text": full_text,
+        "usage": _duration_usage(duration),
+    }
 
 
 def _srt_timestamp(seconds: float, fmt: str) -> str:
@@ -248,6 +410,7 @@ def _srt_timestamp(seconds: float, fmt: str) -> str:
 
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Form(default=""),
     language: Optional[str] = Form(default=None),
@@ -257,25 +420,52 @@ async def create_transcription(
 ):
     """OpenAI-compatible audio transcription endpoint.
 
-    Accepts the same parameters as OpenAI's /v1/audio/transcriptions API.
-    The `model` parameter is accepted but ignored (uses the server's configured backend).
+    Implements the compatibility-oriented subset documented in docs/API.md.
+    The `model` parameter is accepted but ignored (uses the server's configured
+    backend); `prompt` is likewise accepted but has no effect.
     """
     global transcription_engine
+    from fastapi import HTTPException
+
+    if not _token_ok(_bearer_token(request)):
+        raise HTTPException(status_code=401, detail="invalid or missing API token")
+
+    if response_format not in _OPENAI_RESPONSE_FORMATS:
+        allowed = ", ".join(sorted(_OPENAI_RESPONSE_FORMATS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported response_format={response_format!r}. Expected one of: {allowed}.",
+        )
+
+    diarization_enabled = bool(getattr(config, "diarization", False))
+    if response_format == "diarized_json" and not diarization_enabled:
+        raise HTTPException(
+            status_code=400,
+            detail=_DIARIZED_JSON_REQUIRES_DIARIZATION,
+        )
 
     audio_bytes = await file.read()
     if not audio_bytes:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="Empty audio file")
+    max_upload_mb = 512
+    if len(audio_bytes) > max_upload_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio file exceeds the {max_upload_mb} MB upload limit",
+        )
 
     # Convert to PCM for pipeline processing
     pcm_data = await _convert_to_pcm(audio_bytes)
     duration = len(pcm_data) / (16000 * 2)  # 16kHz, 16-bit
 
     # Process through the full pipeline
-    processor = AudioProcessor(
-        transcription_engine=transcription_engine,
-        language=language,
-    )
+    try:
+        processor = AudioProcessor(
+            transcription_engine=transcription_engine,
+            language=language,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     # Force PCM input regardless of server config
     processor.is_pcm_input = True
 
@@ -299,18 +489,45 @@ async def create_transcription(
     # Signal end of audio
     await processor.process_audio(b"")
 
-    # Wait for pipeline to finish
+    # Wait for pipeline to finish. The budget scales with the audio length
+    # (issue #374: a fixed 120 s silently truncated long files) and can be
+    # overridden with --rest-timeout.
+    configured = float(getattr(config, "rest_timeout", 0) or 0)
+    timeout_sec = configured if configured > 0 else max(120.0, duration * 2.5)
+    timed_out = False
     try:
-        await asyncio.wait_for(collect_task, timeout=120.0)
+        await asyncio.wait_for(collect_task, timeout=timeout_sec)
     except asyncio.TimeoutError:
-        logger.warning("Transcription timed out after 120s")
+        timed_out = True
+        logger.warning(
+            "Transcription timed out after %.0fs (audio duration %.0fs)",
+            timeout_sec,
+            duration,
+        )
     finally:
         await processor.cleanup()
 
-    if final_result is None:
-        return JSONResponse({"text": ""})
+    if timed_out:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=408,
+            detail=(
+                f"Transcription did not finish within {timeout_sec:.0f}s "
+                f"for {duration:.0f}s of audio. Retry with a longer "
+                "--rest-timeout or faster hardware/backend."
+            ),
+        )
 
-    result = _format_openai_response(final_result, response_format, language, duration)
+    if final_result is None:
+        final_result = FrontData()
+
+    result = _format_openai_response(
+        final_result,
+        response_format,
+        language,
+        duration,
+        diarization_enabled=diarization_enabled,
+    )
 
     if isinstance(result, str):
         return PlainTextResponse(result)

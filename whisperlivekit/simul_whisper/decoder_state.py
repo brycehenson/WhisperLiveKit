@@ -26,6 +26,7 @@ class DecoderState:
     context: Any = None
 
     pending_incomplete_tokens: List[int] = field(default_factory=list)
+    pending_incomplete_token_timestamps: List[float] = field(default_factory=list)
     pending_retries: int = 0
 
     global_time_offset: float = 0.0
@@ -48,27 +49,19 @@ class DecoderState:
     inference: Any = None
 
     def clean_cache(self):
-        """Clean the kv_cache after each inference step."""
-        # Explicitly delete tensor references to free GPU memory
-        if self.kv_cache:
-            for key in list(self.kv_cache.keys()):
-                tensor = self.kv_cache.pop(key, None)
-                if tensor is not None:
-                    del tensor
-
-        # Clear the dict
+        """Drop per-step kv_cache references without synchronizing CUDA."""
         self.kv_cache.clear()
-
-        # Force GPU cache cleanup (only if CUDA is available)
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         if self.decoder_type == "beam" and self.inference is not None:
             # Create NEW dict instead of sharing reference
             self.inference.kv_cache = {}
             if self.token_decoder is not None:
                 self.token_decoder.reset()
+
+    def release_gpu_memory(self):
+        """Return unused CUDA allocator blocks to the driver at coarse boundaries."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def reset(self, rewind_threshold: int = 200):
         """
@@ -80,6 +73,7 @@ class DecoderState:
         self.last_attend_frame = -rewind_threshold
         self.cumulative_time_offset = 0.0
         self.pending_incomplete_tokens = []
+        self.pending_incomplete_token_timestamps = []
         self.pending_retries = 0
         self.log_segments += 1
 
@@ -95,4 +89,3 @@ class DecoderState:
         self.tokens = []
         self.kv_cache = {}
         self.first_timestamp = None
-

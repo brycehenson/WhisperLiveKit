@@ -82,6 +82,16 @@ BACKENDS = [
         "devices": ["mlx"],
     },
     {
+        "id": "funasr",
+        "name": "FunASR SenseVoice",
+        "module": "funasr",
+        "install": "pip install 'whisperlivekit[funasr]'",
+        "description": "SenseVoiceSmall multilingual ASR through LocalAgreement",
+        "policy": "localagreement",
+        "streaming": "chunk",
+        "devices": ["cpu", "cuda"],
+    },
+    {
         "id": "voxtral-mlx",
         "name": "Voxtral MLX",
         "module": "mlx",
@@ -101,23 +111,26 @@ BACKENDS = [
         "devices": ["cuda", "mps", "cpu"],
     },
     {
-        "id": "qwen3",
-        "name": "Qwen3 ASR",
-        "module": "qwen_asr",
-        "install": "pip install qwen-asr",
-        "description": "Qwen3-ASR with ForcedAligner timestamps",
+        "id": "qwen3-vllm-metal",
+        "name": "Qwen3 vLLM Metal",
+        "module": "vllm_metal",
+        "install": (
+            "Install vLLM with the official vllm-metal script, then install "
+            "'whisperlivekit[qwen3-vllm-metal]'"
+        ),
+        "description": "Qwen3-ASR through vllm-metal in-process STT on Apple Silicon",
+        "platform": "darwin-arm64",
         "streaming": "chunk",
-        "devices": ["cuda", "mps", "cpu"],
+        "devices": ["mlx"],
     },
     {
-        "id": "qwen3-mlx",
-        "name": "Qwen3 MLX",
-        "module": "mlx_qwen3_asr",
-        "install": "pip install mlx-qwen3-asr",
-        "description": "Qwen3-ASR on Apple Silicon (MLX, native streaming)",
-        "platform": "darwin-arm64",
-        "streaming": "native",
-        "devices": ["mlx"],
+        "id": "qwen3-vllm",
+        "name": "Qwen3 vLLM",
+        "module": "vllm",
+        "install": "pip install 'whisperlivekit[qwen3-vllm]'",
+        "description": "Qwen3-ASR through in-process vLLM with ForcedAligner timestamps",
+        "streaming": "chunk",
+        "devices": ["cuda"],
     },
     {
         "id": "openai-api",
@@ -200,12 +213,12 @@ MODEL_CATALOG = [
     # Voxtral (native streaming, single model)
     {"name": "voxtral",         "family": "voxtral", "params": "4B",    "disk": "8.2 GB",  "languages": 15,  "quality": "great",  "speed": "medium"},
     {"name": "voxtral-mlx",     "family": "voxtral", "params": "4B",    "disk": "2.7 GB",  "languages": 15,  "quality": "great",  "speed": "medium"},
-    # Qwen3 ASR
-    {"name": "qwen3:1.7b",      "family": "qwen3",  "params": "1.7B",  "disk": "3.6 GB",  "languages": 12,  "quality": "good",   "speed": "fast"},
-    {"name": "qwen3:0.6b",      "family": "qwen3",  "params": "0.6B",  "disk": "1.4 GB",  "languages": 12,  "quality": "fair",   "speed": "fastest"},
-    # Qwen3 MLX (native streaming on Apple Silicon)
-    {"name": "qwen3-mlx:1.7b",  "family": "qwen3-mlx", "params": "1.7B", "disk": "1.8 GB", "languages": 12, "quality": "good",  "speed": "fast"},
-    {"name": "qwen3-mlx:0.6b",  "family": "qwen3-mlx", "params": "0.6B", "disk": "0.7 GB", "languages": 12, "quality": "fair",  "speed": "fastest"},
+    # Qwen3 vLLM Metal
+    {"name": "qwen3-vllm-metal:1.7b", "family": "qwen3-vllm-metal", "params": "1.7B", "disk": "3.6 GB", "languages": 30, "quality": "good", "speed": "fast"},
+    {"name": "qwen3-vllm-metal:0.6b", "family": "qwen3-vllm-metal", "params": "0.6B", "disk": "1.4 GB", "languages": 12, "quality": "fair", "speed": "fastest"},
+    # Qwen3 vLLM GPU
+    {"name": "qwen3-vllm:1.7b", "family": "qwen3-vllm", "params": "1.7B", "disk": "3.6 GB + aligner", "languages": 12, "quality": "good", "speed": "fast"},
+    {"name": "qwen3-vllm:0.6b", "family": "qwen3-vllm", "params": "0.6B", "disk": "1.4 GB + aligner", "languages": 12, "quality": "fair", "speed": "fastest"},
 ]
 
 
@@ -320,12 +333,15 @@ def _model_is_downloaded(model_entry: dict, downloaded: dict) -> bool:
         return VOXTRAL_HF_REPO in downloaded
     elif name == "voxtral-mlx":
         return VOXTRAL_MLX_REPO in downloaded
-    elif family == "qwen3":
-        size = name.split(":")[1] if ":" in name else "1.7b"
+    elif family == "qwen3-vllm-metal":
+        size = name.split(":")[1] if ":" in name else "0.6b"
         return QWEN3_REPOS.get(size, "") in downloaded
-    elif family == "qwen3-mlx":
+    elif family == "qwen3-vllm":
         size = name.split(":")[1] if ":" in name else "1.7b"
-        return QWEN3_REPOS.get(size, "") in downloaded
+        return (
+            QWEN3_REPOS.get(size, "") in downloaded
+            and QWEN3_ALIGNER_REPO in downloaded
+        )
     return False
 
 
@@ -338,10 +354,10 @@ def _best_backend_for_model(model_entry: dict) -> str:
         if "mlx" in model_entry["name"]:
             return "voxtral-mlx"
         return "voxtral"
-    elif family == "qwen3":
-        return "qwen3"
-    elif family == "qwen3-mlx":
-        return "qwen3-mlx"
+    elif family == "qwen3-vllm-metal":
+        return "qwen3-vllm-metal"
+    elif family == "qwen3-vllm":
+        return "qwen3-vllm"
     elif family == "whisper":
         if is_apple and _module_available("mlx_whisper"):
             return "mlx-whisper"
@@ -402,7 +418,7 @@ def cmd_models():
         # Skip platform-incompatible models
         if name == "voxtral-mlx" and not is_apple_silicon:
             continue
-        if m["family"] == "qwen3-mlx" and not is_apple_silicon:
+        if m["family"] == "qwen3-vllm-metal" and not is_apple_silicon:
             continue
 
         is_dl = _model_is_downloaded(m, downloaded)
@@ -427,6 +443,7 @@ def cmd_models():
     else:
         print("    wlk run large-v3-turbo            # Best quality/speed balance")
         print("    wlk run voxtral                   # Native streaming (CUDA/CPU)")
+    print("    wlk run funasr                    # Fast multilingual SenseVoiceSmall")
     print("    wlk pull base                     # Download smallest multilingual model")
     print("    wlk transcribe audio.mp3          # Offline transcription")
     print()
@@ -459,6 +476,10 @@ def _resolve_pull_target(spec: str):
         backend_part = None
         size_part = spec
 
+    if backend_part is None and size_part == "funasr":
+        # FunASR owns its ModelScope cache; an HF pull would not populate it.
+        return targets
+
     # Handle voxtral
     if size_part == "voxtral" or backend_part == "voxtral":
         targets.append(("voxtral", VOXTRAL_HF_REPO, "Voxtral Mini (HF)"))
@@ -468,28 +489,26 @@ def _resolve_pull_target(spec: str):
         targets.append(("voxtral-mlx", VOXTRAL_MLX_REPO, "Voxtral Mini (MLX)"))
         return targets
 
-    # Handle qwen3-mlx (must check before generic qwen3)
-    if backend_part == "qwen3-mlx" or size_part.startswith("qwen3-mlx"):
-        qwen_size = size_part.split(":")[-1] if ":" in spec else "1.7b"
+    # Handle qwen3-vllm-metal
+    if backend_part == "qwen3-vllm-metal" or size_part.startswith("qwen3-vllm-metal"):
+        qwen_size = size_part.split(":")[-1] if ":" in spec else "0.6b"
         if qwen_size.startswith("qwen3"):
-            qwen_size = "1.7b"  # default
-        repo = QWEN3_REPOS.get(qwen_size)
-        if not repo:
-            print(f"  Unknown Qwen3 size: {qwen_size}. Available: {', '.join(QWEN3_REPOS.keys())}")
+            qwen_size = "0.6b"
+        if qwen_size not in QWEN3_REPOS:
+            print("  qwen3-vllm-metal supports 0.6b and 1.7b")
             return []
-        targets.append(("qwen3-mlx", repo, f"Qwen3-ASR MLX {qwen_size}"))
+        targets.append(("qwen3-vllm-metal", QWEN3_REPOS[qwen_size], f"Qwen3-ASR vLLM Metal {qwen_size}"))
         return targets
 
-    # Handle qwen3
-    if backend_part == "qwen3" or size_part.startswith("qwen3"):
+    # Handle qwen3-vllm
+    if backend_part == "qwen3-vllm" or size_part.startswith("qwen3-vllm"):
         qwen_size = size_part.split(":")[-1] if ":" in spec else "1.7b"
         if qwen_size.startswith("qwen3"):
-            qwen_size = "1.7b"  # default
-        repo = QWEN3_REPOS.get(qwen_size)
-        if not repo:
-            print(f"  Unknown Qwen3 size: {qwen_size}. Available: {', '.join(QWEN3_REPOS.keys())}")
+            qwen_size = "1.7b"
+        if qwen_size not in QWEN3_REPOS:
+            print("  qwen3-vllm supports 0.6b and 1.7b")
             return []
-        targets.append(("qwen3", repo, f"Qwen3-ASR {qwen_size}"))
+        targets.append(("qwen3-vllm", QWEN3_REPOS[qwen_size], f"Qwen3-ASR vLLM {qwen_size}"))
         targets.append(("qwen3-aligner", QWEN3_ALIGNER_REPO, "Qwen3 ForcedAligner"))
         return targets
 
@@ -536,7 +555,7 @@ def _resolve_pull_target(spec: str):
         else:
             print(f"  Unknown model: {spec}")
             print(f"  Available sizes: {', '.join(WHISPER_SIZES)}")
-            print("  Other models: voxtral, voxtral-mlx, qwen3:1.7b, qwen3:0.6b, qwen3-mlx:1.7b, qwen3-mlx:0.6b")
+            print("  Other models: voxtral, voxtral-mlx, qwen3-vllm:1.7b, qwen3-vllm:0.6b, qwen3-vllm-metal:1.7b, qwen3-vllm-metal:0.6b")
             return []
 
     return targets
@@ -544,6 +563,9 @@ def _resolve_pull_target(spec: str):
 
 def cmd_pull(spec: str):
     """Download a model for offline use."""
+    if spec == "funasr":
+        print("\n  funasr downloads its model itself on first use; nothing to pull.\n")
+        return 0
     targets = _resolve_pull_target(spec)
     if not targets:
         return 1
@@ -560,6 +582,31 @@ def cmd_pull(spec: str):
     print("\n  Done. Model ready for offline use.")
     print()
     return 0
+
+
+def _add_diarization_cli_arguments(parser):
+    """Add the diarization options shared by in-process CLI commands."""
+    parser.add_argument("--diarization", action="store_true", help="Enable speaker diarization")
+    parser.add_argument(
+        "--sortformer-max-speakers",
+        type=int,
+        choices=range(1, 5),
+        default=None,
+        help=(
+            "Declare a known Sortformer speaker upper bound from 1 to 4. "
+            "The first N arrival-ordered channels are retained. This does not "
+            "estimate the speaker count; unexpected extra speakers can be "
+            "attributed to a retained label. Default: all checkpoint channels."
+        ),
+    )
+
+
+def _apply_diarization_cli_kwargs(parsed, kwargs):
+    """Pass shared diarization CLI options into the pipeline config."""
+    if parsed.diarization:
+        kwargs["diarization"] = True
+    if parsed.sortformer_max_speakers is not None:
+        kwargs["sortformer_max_speakers"] = parsed.sortformer_max_speakers
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +631,7 @@ def cmd_transcribe(args: list):
     parser.add_argument("--format", default="text", choices=["text", "json", "srt", "vtt", "verbose_json"],
                         help="Output format (default: text)")
     parser.add_argument("--output", "-o", default=None, help="Output file (default: stdout)")
-    parser.add_argument("--diarization", action="store_true", help="Enable speaker diarization")
+    _add_diarization_cli_arguments(parser)
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed processing logs")
 
     parsed = parser.parse_args(args)
@@ -634,8 +681,7 @@ async def _transcribe_files(parsed):
         }
         if parsed.backend != "auto":
             kwargs["backend"] = parsed.backend
-        if parsed.diarization:
-            kwargs["diarization"] = True
+        _apply_diarization_cli_kwargs(parsed, kwargs)
 
         async with TestHarness(**kwargs) as h:
             await h.feed(audio_path, speed=0)
@@ -649,21 +695,10 @@ async def _transcribe_files(parsed):
         elif parsed.format == "json":
             results.append(json_module.dumps({"text": result.committed_text or result.text}))
         elif parsed.format == "verbose_json":
-            results.append(json_module.dumps({
-                "text": result.committed_text or result.text,
-                "duration": round(duration, 2),
-                "language": parsed.lan,
-                "segments": [
-                    {
-                        "text": line.get("text", ""),
-                        "start": line.get("start", "0:00:00"),
-                        "end": line.get("end", "0:00:00"),
-                        "speaker": line.get("speaker", 0),
-                    }
-                    for line in result.lines
-                    if line.get("text") and line.get("speaker", 0) != -2
-                ],
-            }, indent=2))
+            results.append(json_module.dumps(
+                _format_verbose_json_result(result, duration, parsed.lan),
+                indent=2,
+            ))
         elif parsed.format in ("srt", "vtt"):
             results.append(_format_subtitle(result, parsed.format))
 
@@ -675,6 +710,38 @@ async def _transcribe_files(parsed):
         print(f"  Output written to: {parsed.output}", file=sys.stderr)
     else:
         print(output_text)
+
+
+def _format_verbose_json_result(result, duration: float, language: str) -> dict:
+    """Format CLI verbose_json, with a fallback when no lines were finalized."""
+    from whisperlivekit.timed_objects import format_time
+
+    text = result.committed_text or result.text
+    segments = [
+        {
+            "text": line.get("text", ""),
+            "start": line.get("start", "0:00:00"),
+            "end": line.get("end", "0:00:00"),
+            "speaker": line.get("speaker", 0),
+        }
+        for line in result.lines
+        if line.get("text") and line.get("speaker", 0) != -2
+    ]
+
+    if not segments and text.strip():
+        segments.append({
+            "text": text.strip(),
+            "start": "0:00:00.00",
+            "end": format_time(duration),
+            "speaker": 1,
+        })
+
+    return {
+        "text": text,
+        "duration": round(duration, 2),
+        "language": language,
+        "segments": segments,
+    }
 
 
 def _format_subtitle(result, fmt: str) -> str:
@@ -840,7 +907,7 @@ def cmd_listen(args: list):
     parser.add_argument("--backend", default="auto", help="ASR backend (default: auto)")
     parser.add_argument("--model", default="base", dest="model_size", help="Model size (default: base)")
     parser.add_argument("--language", "--lan", default="auto", dest="lan", help="Language code (default: auto)")
-    parser.add_argument("--diarization", action="store_true", help="Enable speaker diarization")
+    _add_diarization_cli_arguments(parser)
     parser.add_argument("--output", "-o", default=None, help="Save transcription to file on exit")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed logs")
 
@@ -890,8 +957,7 @@ async def _listen_main(parsed):
     }
     if parsed.backend != "auto":
         kwargs["backend"] = parsed.backend
-    if parsed.diarization:
-        kwargs["diarization"] = True
+    _apply_diarization_cli_kwargs(parsed, kwargs)
 
     out = sys.stderr
 
@@ -1019,8 +1085,10 @@ def _resolve_run_spec(spec: str):
     if spec == "voxtral-mlx":
         return "voxtral-mlx", None
 
-    if spec == "qwen3-mlx":
-        return "qwen3-mlx", None
+    if spec == "qwen3-vllm-metal":
+        return "qwen3-vllm-metal", None
+    if spec == "qwen3-vllm":
+        return "qwen3-vllm", None
 
     if spec in WHISPER_SIZES:
         return None, spec
@@ -1098,6 +1166,13 @@ def cmd_run(args: list):
 
 def cmd_rm(spec: str):
     """Delete a downloaded model from the cache."""
+    if spec == "funasr":
+        print(
+            "\n  funasr manages its own model cache (typically ~/.cache/modelscope);"
+            " wlk has nothing to remove.\n",
+            file=sys.stderr,
+        )
+        return 0
     targets = _resolve_pull_target(spec)
     if not targets:
         return 1
@@ -1215,7 +1290,7 @@ def cmd_diagnose(args: list):
                         help="Playback speed (1.0=realtime, 0=instant, default: 1.0)")
     parser.add_argument("--probe-interval", type=float, default=2.0,
                         help="Seconds between state probes (default: 2.0)")
-    parser.add_argument("--diarization", action="store_true", help="Enable speaker diarization")
+    _add_diarization_cli_arguments(parser)
 
     parsed = parser.parse_args(args)
 
@@ -1267,11 +1342,20 @@ def _probe_backend_state(processor) -> dict:
     elif hasattr(transcription, "_mlx_processor"):
         info["backend_type"] = "voxtral-mlx"
 
-    # Qwen3 MLX specifics
-    elif hasattr(transcription, "_session") and hasattr(transcription, "_state"):
-        info["backend_type"] = "qwen3-mlx"
-        info["samples_fed"] = getattr(transcription, "_samples_fed", 0)
+    # Qwen3 vLLM specifics
+    elif hasattr(transcription, "_current_words") and hasattr(transcription, "_HOLDBACK_WORDS"):
+        info["backend_type"] = "qwen3-vllm-metal"
         info["committed_words"] = getattr(transcription, "_n_committed_words", 0)
+        info["buffer_words"] = max(
+            len(getattr(transcription, "_current_words", []))
+            - getattr(transcription, "_n_committed_words", 0),
+            0,
+        )
+
+    elif hasattr(transcription, "_current_tokens") and hasattr(transcription, "_HOLDBACK_SECONDS"):
+        info["backend_type"] = "qwen3-vllm"
+        info["last_committed_time"] = getattr(transcription, "_last_committed_time", 0.0)
+        info["buffer_words"] = len(transcription.get_buffer().text.split())
 
     # SimulStreaming specifics
     elif hasattr(transcription, "prev_output"):
@@ -1369,8 +1453,7 @@ async def _diagnose_main(parsed):
     }
     if parsed.backend != "auto":
         kwargs["backend"] = parsed.backend
-    if parsed.diarization:
-        kwargs["diarization"] = True
+    _apply_diarization_cli_kwargs(parsed, kwargs)
 
     t_load_start = time_module.perf_counter()
 

@@ -1,5 +1,5 @@
 
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 
 
 def parse_args():
@@ -12,6 +12,30 @@ def parse_args():
     )
     parser.add_argument(
         "--port", type=int, default=8000, help="The port number to bind the server to."
+    )
+    parser.add_argument(
+        "--translate-on-complete",
+        action="store_true",
+        default=False,
+        dest="translate_on_complete",
+        help=(
+            "Only translate segments once they are finalized by punctuation, "
+            "silence, or end of stream (issue #264). Reduces translation "
+            "flicker at the cost of latency; partial tails are not translated."
+        ),
+    )
+    parser.add_argument(
+        "--api-token",
+        type=str,
+        default=None,
+        dest="api_token",
+        help=(
+            "Require this token on every connection: WebSocket /asr accepts "
+            "?token=... or an Authorization: Bearer header, the REST API "
+            "requires Authorization: Bearer. Default: no authentication "
+            "(only expose the server on trusted networks). The WLK_API_TOKEN "
+            "environment variable is used when the flag is unset."
+        ),
     )
     parser.add_argument(
         "--warmup-file",
@@ -36,6 +60,30 @@ def parse_args():
         action="store_true",
         default=False,
         help="Enable speaker diarization.",
+    )
+
+    parser.add_argument(
+        "--sortformer-model-path",
+        type=str,
+        default=None,
+        dest="sortformer_model_path",
+        help="Path to a local Sortformer .nemo file, a directory containing exactly one .nemo file, or a NeMo/Hugging Face model ID.",
+    )
+
+    parser.add_argument(
+        "--sortformer-max-speakers",
+        type=int,
+        choices=range(1, 5),
+        default=None,
+        dest="sortformer_max_speakers",
+        help=(
+            "Declare that a Sortformer session contains at most this many "
+            "speakers (1-4). The first N arrival-ordered speaker channels are "
+            "kept. This does not estimate the speaker count or reject extra "
+            "speakers; if more are present, attribution to retained labels is "
+            "undefined. Default: use every checkpoint channel (4 for the "
+            "default model)."
+        ),
     )
 
     parser.add_argument(
@@ -87,6 +135,52 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--pause-segmentation-seconds",
+        type=float,
+        default=5.0,
+        dest="pause_segmentation_seconds",
+        help=(
+            "Create a stable transcript boundary after a VAD pause longer than "
+            "this many seconds. Use 0 to disable pause-based segmentation."
+        ),
+    )
+
+    parser.add_argument(
+        "--asr-coalesce-min-s",
+        type=float,
+        default=0.0,
+        dest="asr_coalesce_min_s",
+        help="Defer ASR until this much new audio has accrued, trading update "
+             "cadence for fewer encoder passes. Held-back audio is bounded by "
+             "this value plus one chunk. Non-finite or <= 0 disables (default).",
+    )
+
+    parser.add_argument(
+        "--retention-seconds",
+        type=float,
+        default=None,
+        dest="retention_seconds",
+        help=(
+            "Transcript history kept in server memory per session. Default: "
+            "unlimited for mode=full sessions (the client is sent the whole "
+            "transcript each update), 300 for diff-mode sessions. "
+            "0 = unlimited."
+        ),
+    )
+
+    parser.add_argument(
+        "--rest-timeout",
+        type=float,
+        default=0.0,
+        dest="rest_timeout",
+        help=(
+            "Processing budget in seconds for /v1/audio/transcriptions. "
+            "0 = auto: max(120, 2.5x the audio duration). On expiry the "
+            "endpoint returns HTTP 408 instead of a silent empty result."
+        ),
+    )
+
+    parser.add_argument(
         "--model",
         type=str,
         default="base",
@@ -133,7 +227,9 @@ def parse_args():
         type=str,
         default="",
         dest="target_language",
-        help="Target language for translation. Not functional yet.",
+        help="Target language for translation (NLLB in-process by default; "
+        "see --translation-backend). Sessions can override it with the "
+        "?target_language= WebSocket query parameter.",
     )
 
     parser.add_argument(
@@ -147,8 +243,8 @@ def parse_args():
         "--backend",
         type=str,
         default="auto",
-        choices=["auto", "mlx-whisper", "faster-whisper", "whisper", "openai-api", "voxtral", "voxtral-mlx", "qwen3", "qwen3-mlx", "qwen3-mlx-simul", "qwen3-simul", "vllm-realtime"],
-        help="Select the ASR backend implementation. Use 'qwen3-mlx-simul' for Qwen3-ASR SimulStreaming on Apple Silicon (MLX). Use 'qwen3-mlx' for Qwen3-ASR LocalAgreement on MLX. Use 'qwen3-simul' for Qwen3-ASR SimulStreaming (PyTorch). Use 'vllm-realtime' for vLLM Realtime WebSocket.",
+        choices=["auto", "mlx-whisper", "faster-whisper", "whisper", "openai-api", "funasr", "voxtral", "voxtral-mlx", "qwen3-vllm", "qwen3-vllm-metal", "qwen3-streaming", "canary"],
+        help="Select the ASR backend implementation. Use 'funasr' for SenseVoiceSmall through LocalAgreement (zh/yue/en/ja/ko or auto). Use 'qwen3-vllm' for Qwen3-ASR through in-process vLLM with ForcedAligner on GPU. Use 'qwen3-vllm-metal' for Qwen3-ASR through vllm-metal in-process STT on Apple Silicon. Use 'qwen3-streaming' for Qwen3-ASR through plain HF Transformers with a bounded-recompute audio cache (CUDA/MPS/CPU, no vLLM; requires an explicit --language). Use 'canary' for NVIDIA Canary through NeMo on CUDA or CPU with LocalAgreement.",
     )
     parser.add_argument(
         "--no-vac",
@@ -191,25 +287,399 @@ def parse_args():
     parser.add_argument("--ssl-keyfile", type=str, help="Path to the SSL private key file.", default=None)
     parser.add_argument("--forwarded-allow-ips", type=str, help="Allowed ips for reverse proxying.", default=None)
     parser.add_argument(
+        "--cors-origins",
+        type=str,
+        default="",
+        dest="cors_origins",
+        help="Comma-separated list of allowed CORS origins. Empty disables CORS; use '*' to allow all origins.",
+    )
+    parser.add_argument(
         "--pcm-input",
         action="store_true",
         default=False,
         help="If set, raw PCM (s16le) data is expected as input and FFmpeg will be bypassed. Frontend will use AudioWorklet instead of MediaRecorder."
     )
-    # vLLM Realtime backend arguments
-    parser.add_argument(
-        "--vllm-url",
-        type=str,
-        default="ws://localhost:8000/v1/realtime",
-        dest="vllm_url",
-        help="URL of the vLLM realtime WebSocket endpoint.",
-    )
+    # vLLM Qwen3 backend arguments
     parser.add_argument(
         "--vllm-model",
         type=str,
         default="",
         dest="vllm_model",
         help="Model name to use with vLLM (e.g. Qwen/Qwen3-ASR-1.7B).",
+    )
+    parser.add_argument(
+        "--vllm-aligner-model",
+        type=str,
+        default="Qwen/Qwen3-ForcedAligner-0.6B",
+        dest="vllm_aligner_model",
+        help="ForcedAligner model name to use with the qwen3-vllm backend.",
+    )
+    parser.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=1,
+        dest="vllm_tensor_parallel_size",
+        help="Tensor parallel size for the qwen3-vllm in-process backend.",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.45,
+        dest="vllm_gpu_memory_utilization",
+        help="GPU memory utilization fraction for qwen3-vllm vLLM engines.",
+    )
+    parser.add_argument(
+        "--vllm-dtype",
+        type=str,
+        default="auto",
+        dest="vllm_dtype",
+        help="dtype passed to vLLM for qwen3-vllm engines, e.g. auto, bfloat16, float16.",
+    )
+    parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=0,
+        dest="vllm_max_model_len",
+        help=(
+            "Optional max_model_len passed to qwen3-vllm engines. "
+            "0 keeps the model default."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-audio-backend",
+        choices=["standard", "causal"],
+        default="standard",
+        dest="qwen3_vllm_audio_backend",
+        help=(
+            "Qwen3 CUDA/vLLM audio backend. 'standard' re-encodes the current "
+            "buffer; 'causal' uses the append-only causal audio tower. The "
+            "causal decoder path is selected by "
+            "--qwen3-vllm-causal-decoder-backend."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-causal-decoder-backend",
+        choices=["append-kv", "rolling", "vllm", "vllm-live", "vllm-text"],
+        default="vllm-text",
+        dest="qwen3_vllm_causal_decoder_backend",
+        help=(
+            "Decoder used by qwen3-vllm when --qwen3-vllm-audio-backend=causal. "
+            "'append-kv' keeps a persistent decoder KV over the prompt head "
+            "and audio prefix and uses vLLM only for ForcedAligner timestamps; "
+            "'rolling' is the older name for the same experimental path; "
+            "'vllm' feeds causal audio embeddings to a fresh Qwen3-ASR vLLM "
+            "request per chunk; 'vllm-live' keeps one streaming vLLM text "
+            "decoder request open and appends prompt embeddings with a "
+            "request-local KV prefix; 'vllm-text' exports Qwen3-ASR's text "
+            "decoder as Qwen3ForCausalLM and feeds it causal audio prompt "
+            "embeddings through fresh vLLM requests with prefix caching."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-text-decoder-model",
+        type=str,
+        default="",
+        dest="qwen3_vllm_text_decoder_model",
+        help=(
+            "Optional local Qwen3ForCausalLM export for "
+            "--qwen3-vllm-causal-decoder-backend vllm-text or vllm-live. "
+            "If unset, the decoder is exported into the WhisperLiveKit cache."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-live-idle-timeout-ms",
+        type=float,
+        default=50.0,
+        dest="qwen3_vllm_live_idle_timeout_ms",
+        help=(
+            "Idle gap used to close one partial vLLM-live decode update after "
+            "the last streamed token. Lower values reduce latency; higher "
+            "values are more conservative on slow GPUs."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-causal-attn-implementation",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        default="auto",
+        dest="qwen3_vllm_causal_attn_implementation",
+        help=(
+            "Transformers attention implementation for the qwen3-vllm causal "
+            "rolling ASR decoder. Ignored by the legacy vLLM decoder path."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-tower-checkpoint",
+        type=str,
+        default="",
+        dest="qwen3_vllm_tower_checkpoint",
+        help=(
+            "Local path or Hugging Face repo id for the qwen3-vllm causal "
+            "audio tower checkpoint. Defaults to qfuxa/qwen3-asr-0.6b-streaming "
+            "when causal mode is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-left-context-sec",
+        type=float,
+        default=15.0,
+        dest="qwen3_vllm_left_context_sec",
+        help="Left context retained in the qwen3-vllm causal audio KV cache.",
+    )
+    parser.add_argument(
+        "--qwen3-vllm-block-frames",
+        type=int,
+        default=192,
+        dest="qwen3_vllm_block_frames",
+        help="Fixed mel-frame block size for qwen3-vllm causal audio encoding.",
+    )
+    parser.add_argument(
+        "--qwen3-vllm-cache-block-size",
+        type=int,
+        default=0,
+        dest="qwen3_vllm_cache_block_size",
+        help=(
+            "Optional vLLM KV/prefix-cache block size for qwen3-vllm engines. "
+            "0 keeps vLLM's platform default."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-segment-max-steps",
+        type=int,
+        default=150,
+        dest="qwen3_vllm_segment_max_steps",
+        help=(
+            "Maximum cached causal audio decoder steps before qwen3-vllm "
+            "rolls to a fresh no-past-rewrite segment. 0 disables rollover."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-segment-min-sec",
+        type=float,
+        default=0.0,
+        dest="qwen3_vllm_segment_min_sec",
+        help=(
+            "Minimum active causal segment duration before qwen3-vllm may "
+            "roll. Increase this to avoid rollover on short clips."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-live-multiprocessing",
+        action=BooleanOptionalAction,
+        default=None,
+        dest="qwen3_vllm_live_multiprocessing",
+        help=(
+            "Run the qwen3-vllm vllm-live decoder engine in a separate vLLM "
+            "worker process. Default keeps the deprecated "
+            "WLK_QWEN3_VLLM_LIVE_MULTIPROCESSING env fallback (off)."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-aligner-multiprocessing",
+        action=BooleanOptionalAction,
+        default=None,
+        dest="qwen3_vllm_aligner_multiprocessing",
+        help=(
+            "Run the ForcedAligner engine in a separate vLLM worker process "
+            "when vllm-live multiprocessing is on. Default keeps the "
+            "deprecated WLK_QWEN3_VLLM_ALIGNER_MULTIPROCESSING env fallback."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-prompt-context-words",
+        type=int,
+        default=0,
+        dest="qwen3_vllm_prompt_context_words",
+        help=(
+            "Number of previously committed transcript words injected into "
+            "the next qwen3-vllm causal segment prompt after rollover."
+        ),
+    )
+    parser.add_argument(
+        "--holdback-words",
+        type=int,
+        default=None,
+        dest="holdback_words",
+        help="For Qwen3 vllm-metal, keep this many trailing words uncommitted.",
+    )
+    parser.add_argument(
+        "--no-trim-sentence-buffer",
+        action="store_false",
+        default=True,
+        dest="trim_sentence_buffer",
+        help="Disable Qwen3 vllm-metal buffer trimming at committed sentence boundaries.",
+    )
+    parser.add_argument(
+        "--qwen3-vllm-metal-audio-backend",
+        choices=["standard", "causal"],
+        default="standard",
+        dest="qwen3_vllm_metal_audio_backend",
+        help=(
+            "Qwen3 vllm-metal audio backend. 'standard' re-encodes the current "
+            "buffer; 'causal' uses the experimental append-only causal MLX audio "
+            "tower."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-metal-tower-checkpoint",
+        type=str,
+        default="",
+        dest="qwen3_vllm_metal_tower_checkpoint",
+        help=(
+            "Local path or Hugging Face repo id for the qwen3-vllm-metal causal "
+            "audio tower checkpoint. Defaults to qfuxa/qwen3-asr-0.6b-streaming "
+            "when causal mode is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--qwen3-vllm-metal-left-context-sec",
+        type=float,
+        default=15.0,
+        dest="qwen3_vllm_metal_left_context_sec",
+        help="Left context retained in the qwen3-vllm-metal causal audio KV cache.",
+    )
+    parser.add_argument(
+        "--qwen3-vllm-metal-block-frames",
+        type=int,
+        default=192,
+        dest="qwen3_vllm_metal_block_frames",
+        help="Fixed mel-frame block size for qwen3-vllm-metal causal audio encoding.",
+    )
+
+    # Qwen3 streaming backend arguments
+    qwen3_streaming_group = parser.add_argument_group(
+        'Qwen3 streaming backend arguments (only used with --backend qwen3-streaming)'
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-chunk-sec",
+        type=float,
+        default=2.0,
+        dest="qwen3_streaming_chunk_sec",
+        help="Minimum seconds of new audio per decode update. Decodes self-pace upward on slow hardware.",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-left-context-sec",
+        type=float,
+        default=12.0,
+        dest="qwen3_streaming_left_context_sec",
+        help="Audio tower left context window in seconds (bounded recompute). Quality saturates around 12s on long-form audio.",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-right-context-ms",
+        type=int,
+        default=640,
+        dest="qwen3_streaming_right_context_ms",
+        help="Audio tower right context in milliseconds before an encoder step is finalized.",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-segment-max-steps",
+        type=int,
+        default=200,
+        dest="qwen3_streaming_segment_max_steps",
+        help="Cached decoder steps before the active segment is finalized and rolled (200 steps = ~15s of audio).",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-segment-keep-tail-steps",
+        type=int,
+        default=0,
+        dest="qwen3_streaming_segment_keep_tail_steps",
+        help="Audio embedding steps carried over after a segment roll (0 = hard boundary, validated default).",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-hold-back-words",
+        type=int,
+        default=6,
+        dest="qwen3_streaming_hold_back_words",
+        help="Trailing words held back from commitment until stable.",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-stable-iterations",
+        type=int,
+        default=None,
+        dest="qwen3_streaming_stable_iterations",
+        help=(
+            "Consecutive identical hypothesis prefixes required before "
+            "committing. Default: 2 for the windowed backend, 1 for causal "
+            "(measured p50 commit latency 4.0 s vs 5.9 s for +0.5 pt WER)."
+        ),
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-max-new-tokens",
+        type=int,
+        default=256,
+        dest="qwen3_streaming_max_new_tokens",
+        help="Max tokens per full-hypothesis decode (bounds one segment's text).",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        dest="qwen3_streaming_device",
+        help="Device for the Qwen3 streaming model.",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bfloat16", "float16", "float32"],
+        dest="qwen3_streaming_dtype",
+        help="Model dtype. auto = bfloat16 on CUDA, float16 on MPS, float32 on CPU.",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-attn-implementation",
+        type=str,
+        default="auto",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        dest="qwen3_streaming_attn_implementation",
+        help="Attention implementation passed to Transformers for Qwen3 streaming.",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-context",
+        type=str,
+        default="",
+        dest="qwen3_streaming_context",
+        help="Optional system-prompt context (terminology, names) for the Qwen ASR prompt.",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-prompt-context-words",
+        type=int,
+        default=0,
+        dest="qwen3_streaming_prompt_context_words",
+        help="Trailing transcript words injected into the next segment prompt (0 = disabled; enabling measured worse).",
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-audio-backend",
+        choices=["windowed", "causal"],
+        default="windowed",
+        dest="qwen3_streaming_audio_backend",
+        help=(
+            "Audio encoder execution. 'windowed' (default) re-encodes a bounded "
+            "window per update (best WER). 'causal' runs the append-only "
+            "causal-KV encoder with a fine-tuned tower checkpoint: each audio "
+            "block is encoded exactly once (lowest compute per chunk; requires "
+            "--qwen3-streaming-tower-checkpoint)."
+        ),
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-tower-checkpoint",
+        type=str,
+        default="",
+        dest="qwen3_streaming_tower_checkpoint",
+        help=(
+            "Fine-tuned audio-tower weights for the causal backend: local "
+            ".pt/.safetensors file, directory, or Hugging Face repo id "
+            "(e.g. qfuxa/qwen3-asr-0.6b-streaming)."
+        ),
+    )
+    qwen3_streaming_group.add_argument(
+        "--qwen3-streaming-block-frames",
+        type=int,
+        default=192,
+        dest="qwen3_streaming_block_frames",
+        help=(
+            "Fixed attention-block size in mel frames for the causal backend "
+            "(96 or 192; must match the tower checkpoint training regime)."
+        ),
     )
 
     # SimulStreaming-specific arguments
@@ -316,7 +786,23 @@ def parse_args():
         type=str,
         default=None,
         dest="model_path",
-        help="Direct path to the SimulStreaming Whisper .pt model file. Overrides --model for SimulStreaming backend.",
+        help="Legacy alias for --decoder-model-path. Direct path to the SimulStreaming PyTorch Whisper decoder/alignment model.",
+    )
+
+    simulstreaming_group.add_argument(
+        "--encoder-model-path",
+        type=str,
+        default=None,
+        dest="encoder_model_path",
+        help="Direct path or Hugging Face repo ID for the fast encoder weights used by SimulStreaming hybrid mode (CT2 for faster-whisper, MLX for mlx-whisper).",
+    )
+
+    simulstreaming_group.add_argument(
+        "--decoder-model-path",
+        type=str,
+        default=None,
+        dest="decoder_model_path",
+        help="Direct path or Hugging Face repo ID for the PyTorch Whisper decoder/alignment weights used by SimulStreaming.",
     )
 
     simulstreaming_group.add_argument(
@@ -331,6 +817,86 @@ def parse_args():
         type=str,
         default="600M",
         help="600M or 1.3B",
+    )
+
+    # Canary backend arguments
+    canary_group = parser.add_argument_group(
+        "Canary backend arguments (only used with --backend canary)"
+    )
+    canary_group.add_argument(
+        "--canary-model",
+        type=str,
+        default="nvidia/canary-1b-v2",
+        dest="canary_model",
+        help="Canary model: HuggingFace/NGC id or local .nemo path. Default nvidia/canary-1b-v2.",
+    )
+    canary_group.add_argument(
+        "--canary-default-lang",
+        type=str,
+        default="en",
+        dest="canary_default_lang",
+        help="Fallback source language used while auto-detecting (and if detection stays low-confidence).",
+    )
+    canary_group.add_argument(
+        "--canary-lid-model",
+        type=str,
+        default="langid_ambernet",
+        dest="canary_lid_model",
+        help="NeMo spoken-language-ID model used for auto detection (EncDecSpeakerLabelModel).",
+    )
+    canary_group.add_argument(
+        "--canary-lid-min-sec",
+        type=float,
+        default=2.0,
+        dest="canary_lid_min_sec",
+        help="Minimum seconds of buffered audio before language detection runs.",
+    )
+    canary_group.add_argument(
+        "--canary-lid-min-conf",
+        type=float,
+        default=0.5,
+        dest="canary_lid_min_conf",
+        help="Minimum LID confidence (0-1) required to lock the detected language.",
+    )
+
+    translation_group = parser.add_argument_group("Translation backend")
+    translation_group.add_argument(
+        "--translation-backend",
+        type=str,
+        default="nllb",
+        choices=["nllb", "alignatt"],
+        help="Translation engine for --target-language: 'nllb' (in-process, "
+        "CPU-friendly) or 'alignatt' (Alignatt4LLM sidecar over WebSocket, "
+        "streaming LLM translation with attention-gated commits; requires a "
+        "running alignatt-mt-server).",
+    )
+    translation_group.add_argument(
+        "--alignatt-url",
+        type=str,
+        default="ws://localhost:8765",
+        help="WebSocket URL of the alignatt-mt-server sidecar.",
+    )
+    translation_group.add_argument(
+        "--alignatt-preset",
+        type=str,
+        default=None,
+        help="Sidecar runtime preset to request (e.g. gemma_low_latency).",
+    )
+    translation_group.add_argument(
+        "--alignatt-latency",
+        type=str,
+        default="balanced",
+        choices=["quality", "balanced", "low"],
+        help="Latency/quality point: 'quality' translates committed words only, "
+        "'balanced' also drafts over the unstable ASR tail, 'low' additionally "
+        "drops target-side holdback (pair with a low ASR holdback preset).",
+    )
+    translation_group.add_argument(
+        "--alignatt-context",
+        type=str,
+        default="",
+        help="Free-text domain context (talk title, glossary) injected into "
+        "the MT prompt for every session.",
     )
 
     args = parser.parse_args()

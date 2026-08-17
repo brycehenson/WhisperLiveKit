@@ -8,7 +8,8 @@ This document describes all APIs: the WebSocket streaming API, the OpenAI-compat
 
 ### POST /v1/audio/transcriptions
 
-Drop-in replacement for the OpenAI Audio Transcriptions API. Accepts the same parameters.
+Compatibility-oriented subset of the OpenAI Audio Transcriptions API. Only the
+parameters listed below are accepted, and some are currently ignored as noted.
 
 ```bash
 curl http://localhost:8000/v1/audio/transcriptions \
@@ -24,14 +25,17 @@ curl http://localhost:8000/v1/audio/transcriptions \
 | `model`                  | string   | `""`     | Accepted but ignored (uses server's backend) |
 | `language`               | string   | `null`   | ISO 639-1 language code or null for auto-detection |
 | `prompt`                 | string   | `""`     | Accepted for compatibility, not yet used |
-| `response_format`        | string   | `"json"` | `json`, `verbose_json`, `text`, `srt`, `vtt` |
+| `response_format`        | string   | `"json"` | `json`, `verbose_json`, `diarized_json`, `text`, `srt`, `vtt` |
 | `timestamp_granularities`| array    | `null`   | Accepted for compatibility |
 
 **Response formats:**
 
 `json` (default):
 ```json
-{"text": "Hello world, how are you?"}
+{
+  "text": "Hello world, how are you?",
+  "usage": {"type": "duration", "seconds": 7}
+}
 ```
 
 `verbose_json`:
@@ -41,14 +45,57 @@ curl http://localhost:8000/v1/audio/transcriptions \
   "language": "en",
   "duration": 7.16,
   "text": "Hello world",
-  "words": [{"word": "Hello", "start": 0.0, "end": 0.5}, ...],
-  "segments": [{"id": 0, "start": 0.0, "end": 3.5, "text": "Hello world"}]
+  "words": [
+    {"word": "Hello", "start": 0.0, "end": 0.5},
+    {"word": "world", "start": 0.5, "end": 1.0}
+  ],
+  "segments": [
+    {"id": 0, "start": 0.0, "end": 1.0, "text": "Hello world"}
+  ],
+  "usage": {"type": "duration", "seconds": 7}
+}
+```
+
+`diarized_json`:
+
+This format requires the server to be started with `--diarization`. Requests
+made without diarization enabled return HTTP 400 before the audio is processed.
+
+```json
+{
+  "task": "transcribe",
+  "duration": 7.16,
+  "text": "A: Hello world\nB: Hi there",
+  "segments": [
+    {
+      "type": "transcript.text.segment",
+      "id": "seg_001",
+      "start": 0.0,
+      "end": 1.0,
+      "text": "Hello world",
+      "speaker": "A"
+    },
+    {
+      "type": "transcript.text.segment",
+      "id": "seg_002",
+      "start": 1.1,
+      "end": 2.0,
+      "text": "Hi there",
+      "speaker": "B"
+    }
+  ],
+  "usage": {"type": "duration", "seconds": 7}
 }
 ```
 
 `text`: Plain text response.
 
 `srt` / `vtt`: Subtitle format.
+
+When no speech is detected, the endpoint still returns the schema selected by
+`response_format`. JSON formats contain empty text and segment or word arrays
+where applicable. Text and SRT responses are empty, while VTT contains its
+`WEBVTT` header.
 
 ### GET /v1/models
 
@@ -72,34 +119,92 @@ curl http://localhost:8000/health
 
 ### WS /v1/listen
 
-Drop-in compatible with Deepgram's Live Transcription WebSocket. Connect using any Deepgram client SDK pointed at your local server.
+Compatibility-oriented subset of Deepgram's Live Transcription WebSocket.
+The adapter is verified with `deepgram-sdk==7.7.0`. Install that version and use
+only the parameters and messages documented below.
 
-```python
-from deepgram import DeepgramClient, LiveOptions
-
-deepgram = DeepgramClient(api_key="unused", config={"url": "localhost:8000"})
-connection = deepgram.listen.websocket.v("1")
-connection.start(LiveOptions(model="nova-2", language="en"))
+```bash
+pip install deepgram-sdk==7.7.0
 ```
 
-**Query Parameters:** Same as Deepgram (`language`, `punctuate`, `interim_results`, `vad_events`, etc.).
+```python
+from deepgram import AsyncDeepgramClient
+from deepgram.environment import DeepgramClientEnvironment
+
+environment = DeepgramClientEnvironment(
+    base="http://localhost:8000",
+    production="ws://localhost:8000",
+    agent="ws://localhost:8000",
+    agent_rest="http://localhost:8000",
+)
+# Use the WLK API token here when the server was started with --api-token.
+deepgram = AsyncDeepgramClient(api_key="unused", environment=environment)
+
+async with deepgram.listen.v1.connect(
+    model="nova-3",
+    language="en",
+    encoding="linear16",
+    sample_rate=16000,
+    channels=1,
+    interim_results=True,
+    endpointing=300,
+    utterance_end_ms=1000,
+    vad_events=True,
+) as connection:
+    await connection.send_media(pcm_audio)
+    message = await connection.recv()
+    await connection.send_close_stream()
+```
+
+**Supported Query Parameters:**
+
+- `language`: per-session source language
+- `model`: accepted for SDK compatibility; the server's configured WLK backend
+  remains authoritative
+- `encoding=linear16`: select raw signed 16-bit PCM input; requires
+  `sample_rate=16000`
+- `sample_rate=16000`: WLK's fixed input sample rate for raw PCM
+- `channels=1`: mono input; this is the only supported channel count
+- `interim_results=true|false`: emit revisable `is_final=false` hypotheses;
+  defaults to `false`
+- `endpointing=false|N`: disable pause endpoints or set a positive silence
+  threshold in milliseconds; defaults to 10 ms
+- `utterance_end_ms=N`: enable the independent finalized-word gap detector;
+  requires `interim_results=true` and accepts integers from 1000 to 5000
+- `vad_events=true|false`: emit `SpeechStarted` on VAD speech transitions;
+  defaults to `false`
+
+Numeric endpointing and `vad_events=true` require the server's VAC to be enabled.
+Endpointing uses submitted audio timestamps, not wall-clock time, and is
+independent from `--pause-segmentation-seconds`. A pause endpoint emits
+`speech_final=true` once. `UtteranceEnd` uses its own timer after the last word of
+a final result and is deduplicated for that word timestamp.
 
 **Client Messages:**
 - Binary audio frames
-- `{"type": "KeepAlive"}` — keep connection alive
-- `{"type": "CloseStream"}` — graceful close
-- `{"type": "Finalize"}` — flush pending audio
+- `{"type": "KeepAlive"}`: keep the connection alive without advancing audio time
+- `{"type": "CloseStream"}`: drain pending audio, receive final Results and
+  summary Metadata, then close
+
+Deepgram's non-terminal `Finalize` control is rejected explicitly. WLK backends
+currently expose only a terminal flush, so accepting more audio afterward would
+silently lose it. Send `CloseStream` when the audio is complete. An empty binary
+frame is also rejected and is not treated as EOF.
 
 **Server Messages:**
-- `Metadata` — sent once at connection start
-- `Results` — transcription results with `is_final`/`speech_final` flags
-- `UtteranceEnd` — silence detected after speech
-- `SpeechStarted` — speech begins (requires `vad_events=true`)
+- `Metadata`: request metadata and the final stream summary
+- `Results`: revisable or immutable transcript ranges with independent
+  `is_final` and `speech_final` flags
+- `UtteranceEnd`: finalized-word gap reached when configured
+- `SpeechStarted`: VAD speech begins when `vad_events=true`
 
 **Limitations vs Deepgram:**
-- No authentication (self-hosted)
-- Word timestamps are interpolated from segment boundaries
+- Self-hosted authentication uses the optional WLK API token rather than a
+  Deepgram project key
+- Native ASR token timestamps are preserved when available; multi-word source
+  tokens fall back to interpolation within their token span
 - Confidence scores are 0.0 (not available)
+- `Finalize` and channel-specific finalization are not supported
 
 ---
 
@@ -137,7 +242,7 @@ Auto-pull model if not downloaded, then start the server.
 wlk run voxtral                        # Pull voxtral + start server
 wlk run large-v3                       # Pull large-v3 + start server
 wlk run faster-whisper:base            # Specific backend + model
-wlk run qwen3:1.7b                     # Qwen3-ASR
+wlk run qwen3-vllm-metal:0.6b          # Qwen3-ASR on Apple Silicon
 wlk run voxtral --lan fr --port 9000   # Extra server options passed through
 ```
 
@@ -196,7 +301,7 @@ Download models for offline use.
 wlk pull base                      # Download for best available backend
 wlk pull faster-whisper:large-v3   # Specific backend + model
 wlk pull voxtral                   # Voxtral HF model
-wlk pull qwen3:1.7b               # Qwen3-ASR 1.7B
+wlk pull qwen3-vllm-metal:0.6b    # Qwen3-ASR vLLM Metal 0.6B
 ```
 
 ### `wlk rm`
@@ -525,7 +630,9 @@ After applying a diff, check that `len(lines) == msg["n_lines"]`. A mismatch ind
 
 ## Silence Representation
 
-Silence segments are represented as lines with `speaker` set to `-2` and `text` set to `null`:
+Silence segments are represented as lines with `speaker` set to `-2`. Their
+`text` is `null` with diarization and an empty string without diarization, so
+clients should identify them by `speaker`:
 
 ```json
 {
@@ -536,7 +643,15 @@ Silence segments are represented as lines with `speaker` set to `-2` and `text` 
 }
 ```
 
-Silence segments are only generated for pauses longer than 5 seconds.
+Silence segments are generated when a VAD pause is longer than
+`--pause-segmentation-seconds`, which defaults to 5 seconds. The qualifying pause
+creates one stable line boundary without changing word text or timestamps, both
+with and without diarization. Use `--pause-segmentation-seconds 0` to disable these
+boundaries. The boundary is committed after the pause ends, when speech resumes
+or end of input is received; an in-progress pause is not added to `lines`. The
+native `/asr` WebSocket uses the server-wide setting. The
+Deepgram-compatible `/v1/listen` endpoint instead keeps its per-session
+`endpointing` timer separate from these native output lines.
 
 ---
 

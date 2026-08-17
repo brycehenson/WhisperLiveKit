@@ -17,12 +17,19 @@ WHISPER_LANG_CODES = "af,am,ar,as,az,ba,be,bg,bn,bo,br,bs,ca,cs,cy,da,de,el,en,e
 )
 
 
+# Not Whisper codes, but the sentence tokenizers below handle them
+# (mosestokenizer supports yue directly; used by the FunASR backend).
+EXTRA_TOKENIZER_LANG_CODES = ["yue"]
+
+
 def create_tokenizer(lan):
     """returns an object that has split function that works like the one of MosesTokenizer"""
 
-    assert (
-        lan in WHISPER_LANG_CODES
-    ), "language must be Whisper's supported lang code: " + " ".join(WHISPER_LANG_CODES)
+    if lan not in WHISPER_LANG_CODES and lan not in EXTRA_TOKENIZER_LANG_CODES:
+        raise ValueError(
+            "language must be a supported sentence-tokenizer lang code: "
+            + " ".join(WHISPER_LANG_CODES + EXTRA_TOKENIZER_LANG_CODES)
+        )
 
     if lan == "uk":
         import tokenize_uk
@@ -78,7 +85,33 @@ def backend_factory(
             confidence_validation,
             warmup_file=None,
             min_chunk_size=None,
+            **_unused_kwargs,
         ):
+    if backend == "funasr":
+        from whisperlivekit.config import FUNASR_LANGUAGES
+        from whisperlivekit.funasr_backend import FunASRASR
+
+        if lan not in FUNASR_LANGUAGES:
+            supported = ", ".join(sorted(FUNASR_LANGUAGES))
+            raise ValueError(f"FunASR SenseVoiceSmall supports only: {supported}.")
+        t = time.time()
+        logger.info("Loading SenseVoiceSmall for language %s using FunASR...", lan)
+        asr = FunASRASR(
+            lan=lan,
+            model_size=model_size,
+            cache_dir=model_cache_dir,
+            model_dir=model_dir,
+        )
+        tokenizer = create_tokenizer(lan) if buffer_trimming == "sentence" else None
+        warmup_asr(asr, warmup_file)
+        asr.confidence_validation = confidence_validation
+        asr.tokenizer = tokenizer
+        asr.buffer_trimming = buffer_trimming
+        asr.buffer_trimming_sec = buffer_trimming_sec
+        asr.backend_choice = "funasr"
+        logger.info("done. It took %.2f seconds.", time.time() - t)
+        return asr
+
     backend_choice = backend
     custom_reference = model_path or model_dir
     resolved_root = None

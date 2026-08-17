@@ -1,7 +1,7 @@
-FROM ghcr.io/astral-sh/uv:0.10.4 AS uvbin
+FROM ghcr.io/astral-sh/uv:0.12.3 AS uvbin
 
 # --- MARK: Builder Stage
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder-gpu
+FROM nvidia/cuda:12.9.2-cudnn-devel-ubuntu24.04 AS builder-gpu
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
@@ -25,6 +25,10 @@ RUN uv python install 3.12
 # Install dependencies first to leverage caching
 ARG EXTRAS=cu129
 COPY pyproject.toml uv.lock /app/
+# The qwen3 extras resolve qwen3-asr-causal from the submodule path
+# (tool.uv.sources); the build context must have submodules initialized:
+#   git submodule update --init
+COPY third_party /app/third_party
 RUN set -eux; \
   set --; \
   for extra in $(echo "${EXTRAS:-}" | tr ',' ' '); do \
@@ -42,7 +46,7 @@ RUN set -eux; \
   uv sync --frozen --no-editable --no-cache "$@"
 
 # --- MARK: Runtime Stage 
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
