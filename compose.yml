@@ -14,7 +14,14 @@ services:
       # - ${HF_TKN_FILE:-./token}:/root/.cache/huggingface/token:ro
     environment:
       - HF_TOKEN
-    command: ["--model", "medium", "--diarization", "--pcm-input"]
+    command:
+      - "--model=medium"
+      - "--diarization"
+      - "--pcm-input"
+      - "--allow-dev-unload"
+      - "--model-auto-unload-enabled"
+      - "--model-auto-unload-timeout-seconds=30"
+      - "--model-unload-strategy=cpu_cache"
 
   wlk-gpu-voxtral:
     build:
@@ -31,7 +38,13 @@ services:
       # - ${HF_TKN_FILE:-./token}:/root/.cache/huggingface/token:ro
     environment:
       - HF_TOKEN
-    command: ["--backend", "voxtral", "--pcm-input"]
+    command:
+      - "--backend=voxtral"
+      - "--pcm-input"
+      - "--allow-dev-unload"
+      - "--model-auto-unload-enabled"
+      - "--model-auto-unload-timeout-seconds=30"
+      - "--model-unload-strategy=cpu_cache"
 
   wlk-cpu:
     build:
@@ -47,6 +60,11 @@ services:
       # - ${HF_TKN_FILE:-./token}:/root/.cache/huggingface/token:ro
     environment:
       - HF_TOKEN
+    command:
+      - "--allow-dev-unload"
+      - "--model-auto-unload-enabled"
+      - "--model-auto-unload-timeout-seconds=30"
+      - "--model-unload-strategy=cpu_cache"
 
 volumes:
   hf-cache:

@@ -1,7 +1,10 @@
 import io
+import gc
 import logging
 import math
 import sys
+import threading
+import time
 from typing import List
 
 import numpy as np
@@ -20,6 +23,12 @@ class ASRBase:
         self.logfile = logfile
         self.transcribe_kargs = {}
         self.lora_path = lora_path
+        self._model_args = (model_size, cache_dir, model_dir)
+        self._model_lock = threading.RLock()
+        self._model_unloaded = False
+        self._last_unload_strategy = None
+        self._model_files_cpu_cache = None
+        self._model_files_cpu_cache_bytes = 0
         if lan == "auto":
             self.original_language = None
         else:
@@ -34,6 +43,62 @@ class ASRBase:
 
     def use_vad(self):
         raise NotImplementedError("must be implemented in the child class")
+
+    def ensure_model_loaded(self):
+        with self._model_lock:
+            if self.model is None:
+                started = time.perf_counter()
+                self.model = self.load_model(*self._model_args)
+                elapsed = time.perf_counter() - started
+                logger.info(
+                    "Reloaded %s model from %s in %.2fs",
+                    self.__class__.__name__,
+                    self._reload_source_description(),
+                    elapsed,
+                )
+                self._model_unloaded = False
+        return self.model
+
+    def unload_model(self, keep_cpu_cache: bool = True):
+        with self._model_lock:
+            was_loaded = self.model is not None
+            self.model = None
+            self._model_unloaded = True
+            self._last_unload_strategy = "cpu_cache" if keep_cpu_cache else "drop"
+        _clear_accelerator_memory()
+        return {"loaded_before": was_loaded, "cpu_cached": False}
+
+    def model_status(self):
+        return {
+            "loaded": self.model is not None,
+            "unloaded": self._model_unloaded,
+            "cpu_cached": False,
+        }
+
+    def _reload_source_description(self):
+        if self._last_unload_strategy == "cpu_cache":
+            return "local model files/cache (cpu_cache requested; no in-memory CPU copy is available for this backend)"
+        return "local model files/cache"
+
+
+def _clear_accelerator_memory():
+    gc.collect()
+    try:
+        import torch
+    except Exception:
+        torch = None
+    if torch is not None:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
 
 
 class WhisperASR(ASRBase):
@@ -60,6 +125,7 @@ class WhisperASR(ASRBase):
         return load_whisper_model(model_size, download_root=cache_dir, lora_path=self.lora_path)
 
     def transcribe(self, audio, init_prompt=""):
+        self.ensure_model_loaded()
         options = dict(self.transcribe_kargs)
         options.pop("vad", None)
         options.pop("vad_filter", None)
@@ -105,28 +171,105 @@ class FasterWhisperASR(ASRBase):
     def load_model(self, model_size=None, cache_dir=None, model_dir=None):
         from faster_whisper import WhisperModel
 
+        files = None
         if model_dir is not None:
             resolved_path = resolve_model_path(model_dir)
             logger.debug(f"Loading faster-whisper model from {resolved_path}. "
                          f"model_size and cache_dir parameters are not used.")
             model_size_or_path = str(resolved_path)
+            self._resolved_model_path = resolved_path
         elif model_size is not None:
             model_size_or_path = model_size
+            self._resolved_model_path = None
         else:
             raise ValueError("Either model_size or model_dir must be set")
+        self._model_size_or_path = model_size_or_path
+        self._cache_dir = cache_dir
         device = "auto" # Allow CTranslate2 to decide available device
-        compute_type = "auto" # Allow CTranslate2 to decide faster compute type
+        # set here for qantization when running local_agreement
+        # int8_float16 auto
+        compute_type = "int8_float16" # Allow CTranslate2 to decide faster compute type
 
+        cpu_cache = getattr(self, "_model_files_cpu_cache", None)
+        if cpu_cache:
+            files = dict(cpu_cache)
 
         model = WhisperModel(
             model_size_or_path,
             device=device,
             compute_type=compute_type,
             download_root=cache_dir,
+            files=files,
         )
         return model
 
+    def unload_model(self, keep_cpu_cache: bool = True):
+        with self._model_lock:
+            was_loaded = self.model is not None
+            self._model_files_cpu_cache = None
+            self._model_files_cpu_cache_bytes = 0
+            if keep_cpu_cache:
+                self._cache_model_files_in_cpu()
+            self.model = None
+            self._model_unloaded = True
+            self._last_unload_strategy = "cpu_cache" if keep_cpu_cache else "drop"
+        _clear_accelerator_memory()
+        return {
+            "loaded_before": was_loaded,
+            "cpu_cached": self._model_files_cpu_cache is not None,
+            "cpu_cache_bytes": self._model_files_cpu_cache_bytes,
+        }
+
+    def model_status(self):
+        cpu_cache = getattr(self, "_model_files_cpu_cache", None)
+        return {
+            "loaded": self.model is not None,
+            "unloaded": self._model_unloaded,
+            "cpu_cached": cpu_cache is not None,
+            "cpu_cache_bytes": getattr(self, "_model_files_cpu_cache_bytes", 0),
+        }
+
+    def _cache_model_files_in_cpu(self):
+        from faster_whisper.utils import download_model
+
+        if getattr(self, "_resolved_model_path", None) is not None:
+            model_path = self._resolved_model_path
+        else:
+            model_path = download_model(
+                self._model_size_or_path,
+                local_files_only=True,
+                cache_dir=self._cache_dir,
+            )
+            model_path = resolve_model_path(model_path)
+
+        if not model_path.is_dir():
+            raise FileNotFoundError(f"Cannot CPU-cache faster-whisper model files from {model_path}")
+
+        files = {}
+        total_bytes = 0
+        started = time.perf_counter()
+        for path in sorted(p for p in model_path.rglob("*") if p.is_file()):
+            relative = str(path.relative_to(model_path))
+            content = path.read_bytes()
+            files[relative] = content
+            total_bytes += len(content)
+
+        self._model_files_cpu_cache = files
+        self._model_files_cpu_cache_bytes = total_bytes
+        logger.info(
+            "Cached faster-whisper model files in CPU RAM from %s: %.2f GiB in %.2fs",
+            model_path,
+            total_bytes / (1024 ** 3),
+            time.perf_counter() - started,
+        )
+
+    def _reload_source_description(self):
+        if getattr(self, "_model_files_cpu_cache", None):
+            return f"CPU RAM model-file cache ({self._model_files_cpu_cache_bytes / (1024 ** 3):.2f} GiB)"
+        return super()._reload_source_description()
+
     def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list:
+        self.ensure_model_loaded()
         segments, info = self.model.transcribe(
             audio,
             language=self.original_language,

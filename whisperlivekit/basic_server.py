@@ -5,7 +5,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -69,6 +69,38 @@ async def health():
         "backend": backend,
         "ready": transcription_engine is not None,
     })
+
+
+@app.post("/dev/unload")
+async def unload_model():
+    """Release ASR model memory; reloads lazily on the next transcription session."""
+    global transcription_engine
+    if not transcription_engine:
+        raise HTTPException(status_code=503, detail="Transcription engine is not ready")
+    if not getattr(transcription_engine.config, "allow_dev_unload", False):
+        raise HTTPException(
+            status_code=403,
+            detail="POST /dev/unload is disabled. Start with --allow-dev-unload or ALLOW_DEV_UNLOAD=true.",
+        )
+
+    result = transcription_engine.unload_model()
+    if not result.get("unloaded") and result.get("reason") == "active_sessions":
+        raise HTTPException(status_code=409, detail=result)
+    return JSONResponse(result)
+
+
+@app.get("/dev/unload")
+async def unload_status():
+    """Report current ASR model unload status."""
+    global transcription_engine
+    if not transcription_engine:
+        raise HTTPException(status_code=503, detail="Transcription engine is not ready")
+    if not getattr(transcription_engine.config, "allow_dev_unload", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Model unload status is disabled. Start with --allow-dev-unload or ALLOW_DEV_UNLOAD=true.",
+        )
+    return JSONResponse(transcription_engine.model_status())
 
 
 async def handle_websocket_results(websocket, results_generator, diff_tracker=None):

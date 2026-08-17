@@ -73,6 +73,10 @@ class WhisperLiveKitConfig:
     sortformer_model_path: Optional[str] = None
     backend_policy: str = "simulstreaming"
     backend: str = "auto"
+    allow_dev_unload: bool = False
+    model_auto_unload_enabled: bool = False
+    model_auto_unload_timeout_seconds: float = 30.0
+    model_unload_strategy: str = "cpu_cache"
 
     # Transcription common
     warmup_file: Optional[str] = None

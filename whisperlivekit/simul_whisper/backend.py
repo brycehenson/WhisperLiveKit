@@ -3,6 +3,8 @@ import logging
 import platform
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -308,6 +310,11 @@ class SimulStreamingASR:
         self._resolved_model_path = None
         self._resolved_decoder_model_path = None
         self._resolved_encoder_model_path = None
+        self._model_lock = threading.RLock()
+        self._model_unloaded = False
+        self._last_unload_strategy = None
+        self._mlx_model_path = None
+        self._fw_model_ref = None
         self.encoder_backend = "whisper"
         self.use_full_mlx = getattr(self, "use_full_mlx", False)
         preferred_backend = getattr(self, "backend", "auto")
@@ -404,6 +411,7 @@ class SimulStreamingASR:
                 raise FileNotFoundError(
                     f"MLX Whisper backend requested but no compatible weights found for model '{self.model_name}'."
                 )
+            self._mlx_model_path = mlx_model_path
             self.mlx_model = load_mlx_model(path_or_hf_repo=mlx_model_path)
             self._warmup_mlx_model()
         elif self.encoder_backend == "mlx-whisper":
@@ -419,6 +427,7 @@ class SimulStreamingASR:
                 raise FileNotFoundError(
                     f"MLX Whisper backend requested but no compatible weights found for model '{self.model_name}'."
                 )
+            self._mlx_model_path = mlx_model_path
             self.mlx_encoder = load_mlx_encoder(path_or_hf_repo=mlx_model_path)
             self.shared_model = self.load_model()
         elif self.encoder_backend == "faster-whisper":
@@ -429,6 +438,7 @@ class SimulStreamingASR:
                 fw_model = str(self._resolved_decoder_model_path)
             else:
                 fw_model = self.model_name
+            self._fw_model_ref = fw_model
             self.fw_encoder = WhisperModel(
                 fw_model,
                 device='auto',
@@ -551,6 +561,79 @@ class SimulStreamingASR:
             else:
                 whisper_model.transcribe(warmup_audio, language=self.lan if self.lan != 'auto' else None)
         return whisper_model
+
+    def ensure_model_loaded(self):
+        with self._model_lock:
+            was_loaded = any(
+                model is not None
+                for model in (self.shared_model, self.mlx_encoder, self.fw_encoder, self.mlx_model)
+            )
+            started = time.perf_counter()
+            if self.use_full_mlx:
+                if self.mlx_model is None:
+                    self.mlx_model = load_mlx_model(path_or_hf_repo=self._mlx_model_path)
+                    self._warmup_mlx_model()
+                    self._model_unloaded = False
+                    logger.info(
+                        "Reloaded SimulStreaming MLX model from %s in %.2fs",
+                        self._reload_source_description(),
+                        time.perf_counter() - started,
+                    )
+                return self.mlx_model
+
+            if self.encoder_backend == "mlx-whisper" and self.mlx_encoder is None:
+                self.mlx_encoder = load_mlx_encoder(path_or_hf_repo=self._mlx_model_path)
+            if self.encoder_backend == "faster-whisper" and self.fw_encoder is None:
+                self.fw_encoder = WhisperModel(
+                    self._fw_model_ref,
+                    device='auto',
+                    compute_type='auto',
+                )
+            if self.shared_model is None:
+                self.shared_model = self.load_model()
+                self._model_unloaded = False
+            if not was_loaded:
+                logger.info(
+                    "Reloaded SimulStreaming model from %s in %.2fs (encoder_backend=%s)",
+                    self._reload_source_description(),
+                    time.perf_counter() - started,
+                    self.encoder_backend,
+                )
+            return self.shared_model
+
+    def unload_model(self, keep_cpu_cache: bool = True):
+        from whisperlivekit.local_agreement.backends import _clear_accelerator_memory
+
+        with self._model_lock:
+            loaded_before = any(
+                model is not None
+                for model in (self.shared_model, self.mlx_encoder, self.fw_encoder, self.mlx_model)
+            )
+            self.shared_model = None
+            self.mlx_encoder = None
+            self.fw_encoder = None
+            self.mlx_model = None
+            self._model_unloaded = True
+            self._last_unload_strategy = "cpu_cache" if keep_cpu_cache else "drop"
+        _clear_accelerator_memory()
+        return {"loaded_before": loaded_before, "cpu_cached": False}
+
+    def model_status(self):
+        loaded = any(
+            model is not None
+            for model in (self.shared_model, self.mlx_encoder, self.fw_encoder, self.mlx_model)
+        )
+        return {
+            "loaded": loaded,
+            "unloaded": self._model_unloaded,
+            "cpu_cached": False,
+            "encoder_backend": self.encoder_backend,
+        }
+
+    def _reload_source_description(self):
+        if self._last_unload_strategy == "cpu_cache":
+            return "local model files/cache (cpu_cache requested; no in-memory CPU copy is available for this backend)"
+        return "local model files/cache"
 
     def set_translate_task(self):
         """Set up translation task."""
