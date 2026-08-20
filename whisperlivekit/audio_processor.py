@@ -116,6 +116,16 @@ class AudioProcessor:
             models = kwargs['transcription_engine']
         else:
             models = TranscriptionEngine(**kwargs)
+        self.models = models
+        self._session_registered = False
+        models.register_session()
+        self._session_registered = True
+        try:
+            models.ensure_model_loaded()
+        except Exception:
+            models.unregister_session()
+            self._session_registered = False
+            raise
 
         # Audio processing settings
         self.args = models.args
@@ -1079,6 +1089,10 @@ class AudioProcessor:
                 logger.warning(f"Error stopping FFmpeg manager: {e}")
         if self.diarization:
             self.diarization.close()
+
+        if self._session_registered:
+            self.models.unregister_session()
+            self._session_registered = False
 
         # Finalize session metrics
         self.metrics.total_audio_duration_s = self.total_pcm_samples / self.sample_rate
