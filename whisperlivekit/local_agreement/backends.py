@@ -169,10 +169,43 @@ class FasterWhisperASR(ASRBase):
     """Uses faster-whisper as the backend."""
     sep = ""
 
+    def _ct2_model_is_loaded(self):
+        if self.model is None:
+            return False
+        ct2_model = getattr(self.model, "model", None)
+        model_is_loaded = getattr(ct2_model, "model_is_loaded", None)
+        if model_is_loaded is None:
+            return True
+        return bool(model_is_loaded)
+
+    def ensure_model_loaded(self):
+        with self._model_lock:
+            if self.model is None:
+                started = time.perf_counter()
+                self.model = self.load_model(*self._model_args)
+                elapsed = time.perf_counter() - started
+                logger.info(
+                    "Reloaded %s model from %s in %.2fs",
+                    self.__class__.__name__,
+                    self._reload_source_description(),
+                    elapsed,
+                )
+                self._model_unloaded = False
+            elif not self._ct2_model_is_loaded():
+                started = time.perf_counter()
+                self.model.model.load_model(keep_cache=True)
+                elapsed = time.perf_counter() - started
+                logger.info(
+                    "Reloaded %s CTranslate2 weights from CPU cache in %.2fs",
+                    self.__class__.__name__,
+                    elapsed,
+                )
+                self._model_unloaded = False
+        return self.model
+
     def load_model(self, model_size=None, cache_dir=None, model_dir=None):
         from faster_whisper import WhisperModel
 
-        files = None
         if model_dir is not None:
             resolved_path = resolve_model_path(model_dir)
             logger.debug(f"Loading faster-whisper model from {resolved_path}. "
@@ -191,83 +224,50 @@ class FasterWhisperASR(ASRBase):
         # int8_float16 auto
         compute_type = "int8_float16" # Allow CTranslate2 to decide faster compute type
 
-        cpu_cache = getattr(self, "_model_files_cpu_cache", None)
-        if cpu_cache:
-            files = dict(cpu_cache)
-
         model = WhisperModel(
             model_size_or_path,
             device=device,
             compute_type=compute_type,
             download_root=cache_dir,
-            files=files,
         )
         return model
 
     def unload_model(self, keep_cpu_cache: bool = True):
         with self._model_lock:
-            was_loaded = self.model is not None
-            self._model_files_cpu_cache = None
-            self._model_files_cpu_cache_bytes = 0
-            if keep_cpu_cache:
-                self._cache_model_files_in_cpu()
-            self.model = None
+            was_loaded = self._ct2_model_is_loaded()
+            if keep_cpu_cache and self.model is not None:
+                ct2_model = getattr(self.model, "model", None)
+                unload_model = getattr(ct2_model, "unload_model", None)
+                if unload_model is not None:
+                    unload_model(to_cpu=True)
+                else:
+                    self.model = None
+                    keep_cpu_cache = False
+            else:
+                self.model = None
             self._model_unloaded = True
             self._last_unload_strategy = "move_to_cpu" if keep_cpu_cache else "drop"
         _clear_accelerator_memory()
         return {
             "loaded_before": was_loaded,
-            "cpu_cached": self._model_files_cpu_cache is not None,
-            "cpu_cache_bytes": self._model_files_cpu_cache_bytes,
+            "cpu_cached": keep_cpu_cache and self.model is not None,
+            "cpu_cache_bytes": 0,
+            "ct2_cpu_cached": keep_cpu_cache and self.model is not None,
         }
 
     def model_status(self):
+        ct2_cpu_cached = self.model is not None and not self._ct2_model_is_loaded()
         return {
-            "loaded": self.model is not None,
+            "loaded": self._ct2_model_is_loaded(),
             "unloaded": self._model_unloaded,
-            "cpu_cached": getattr(self, "_model_files_cpu_cache", None) is not None,
-            "cpu_cache_bytes": getattr(self, "_model_files_cpu_cache_bytes", 0),
+            "cpu_cached": ct2_cpu_cached,
+            "cpu_cache_bytes": 0,
+            "ct2_cpu_cached": ct2_cpu_cached,
         }
 
-    def _cache_model_files_in_cpu(self):
-        from faster_whisper.utils import download_model
-
-        if getattr(self, "_resolved_model_path", None) is not None:
-            model_path = self._resolved_model_path
-        else:
-            model_path = download_model(
-                self._model_size_or_path,
-                local_files_only=True,
-                cache_dir=self._cache_dir,
-            )
-            model_path = resolve_model_path(model_path)
-
-        if not model_path.is_dir():
-            raise FileNotFoundError(
-                f"Cannot move faster-whisper model files to CPU RAM from {model_path}"
-            )
-
-        files = {}
-        total_bytes = 0
-        started = time.perf_counter()
-        for path in sorted(p for p in model_path.rglob("*") if p.is_file()):
-            relative = str(path.relative_to(model_path))
-            content = path.read_bytes()
-            files[relative] = content
-            total_bytes += len(content)
-
-        self._model_files_cpu_cache = files
-        self._model_files_cpu_cache_bytes = total_bytes
-        logger.info(
-            "Moved faster-whisper model files to CPU RAM from %s: %.2f GiB in %.2fs",
-            model_path,
-            total_bytes / (1024 ** 3),
-            time.perf_counter() - started,
-        )
-
     def _reload_source_description(self):
-        if getattr(self, "_model_files_cpu_cache", None):
-            return f"CPU RAM model-file cache ({self._model_files_cpu_cache_bytes / (1024 ** 3):.2f} GiB)"
+        if self.model is not None and not self._ct2_model_is_loaded():
+            return "CTranslate2 CPU weight cache"
         return super()._reload_source_description()
 
     def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> list:

@@ -447,11 +447,14 @@ class TranscriptionEngine:
             self._auto_unload_timer = None
             if self._active_sessions:
                 return
+        started = time.perf_counter()
         result = self.unload_model()
+        unload_elapsed = time.perf_counter() - started
         if result.get("unloaded"):
             logger.info(
-                "Auto-unloaded ASR model after %.1fs idle",
+                "Auto-unloaded ASR model after %.1fs idle in %.2fs",
                 getattr(self.config, "model_auto_unload_timeout_seconds", 30.0),
+                unload_elapsed,
             )
         else:
             logger.info("Skipped ASR auto-unload: %s", result.get("reason"))

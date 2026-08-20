@@ -274,8 +274,8 @@ def parse_args():
         choices=["move_to_cpu", "drop"],
         dest="model_unload_strategy",
         help=(
-            "Model unload strategy. 'move_to_cpu' keeps faster-whisper model "
-            "files in CPU RAM; 'drop' fully drops in-memory model objects."
+            "Model unload strategy. 'move_to_cpu' keeps supported backend "
+            "weights in CPU RAM; 'drop' fully drops in-memory model objects."
         ),
     )
     parser.add_argument(
