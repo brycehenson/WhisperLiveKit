@@ -1,5 +1,5 @@
-import threading
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
@@ -7,8 +7,6 @@ import pytest
 
 pytest.importorskip("torch")
 sys.modules.setdefault("soundfile", types.SimpleNamespace())
-
-from whisperlivekit.core import TranscriptionEngine
 
 
 class DummyASR:
@@ -35,6 +33,8 @@ class DummyASR:
 
 
 def make_engine(asr=None):
+    from whisperlivekit.core import TranscriptionEngine
+
     TranscriptionEngine.reset()
     engine = TranscriptionEngine.__new__(TranscriptionEngine)
     engine.asr = asr

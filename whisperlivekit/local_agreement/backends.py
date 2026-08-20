@@ -1,5 +1,5 @@
-import io
 import gc
+import io
 import logging
 import math
 import sys

@@ -26,11 +26,7 @@ class VoxtralHFStreamingASR:
     sep = " "
 
     def __init__(self, logfile=sys.stderr, **kwargs):
-        import torch
-        from transformers import (
-            AutoProcessor,
-            VoxtralRealtimeForConditionalGeneration,
-        )
+        from transformers import AutoProcessor
 
         self.logfile = logfile
         self.transcribe_kargs = {}
