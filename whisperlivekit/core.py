@@ -1,4 +1,5 @@
 import logging
+import inspect
 import threading
 import time
 from argparse import Namespace
@@ -389,10 +390,18 @@ class TranscriptionEngine:
                     "active_sessions": self._active_sessions,
                 }
             self._cancel_auto_unload_timer_locked()
-            unload_info = self.asr.unload_model()
+            strategy = getattr(self.config, "model_unload_strategy", "move_to_cpu")
+            keep_cpu_cache = strategy == "move_to_cpu"
+            unload_signature = inspect.signature(self.asr.unload_model)
+            if "keep_cpu_cache" in unload_signature.parameters:
+                unload_info = self.asr.unload_model(keep_cpu_cache=keep_cpu_cache)
+            else:
+                unload_info = self.asr.unload_model()
+                unload_info.setdefault("cpu_cached", False)
             return {
                 "unloaded": True,
                 "backend": self.config.backend,
+                "strategy": strategy,
                 "active_sessions": self._active_sessions,
                 **unload_info,
             }
@@ -402,13 +411,14 @@ class TranscriptionEngine:
         if self.asr and hasattr(self.asr, "model_status"):
             status = self.asr.model_status()
         elif self.asr:
-            status = {"loaded": True, "unloaded": False}
+            status = {"loaded": True, "unloaded": False, "cpu_cached": False}
         else:
-            status = {"loaded": False, "unloaded": False}
+            status = {"loaded": False, "unloaded": False, "cpu_cached": False}
         return {
             "backend": self.config.backend,
             "active_sessions": self.active_sessions,
             "auto_unload_timeout_seconds": getattr(self.config, "model_auto_unload_timeout_seconds", 30.0),
+            "strategy": getattr(self.config, "model_unload_strategy", "move_to_cpu"),
             **status,
         }
 
@@ -426,7 +436,11 @@ class TranscriptionEngine:
         timer.daemon = True
         self._auto_unload_timer = timer
         timer.start()
-        logger.info("Scheduled ASR model auto-unload in %.1fs", timeout)
+        logger.info(
+            "Scheduled ASR model auto-unload in %.1fs using %s strategy",
+            timeout,
+            getattr(self.config, "model_unload_strategy", "move_to_cpu"),
+        )
 
     def _auto_unload_if_idle(self):
         with self._lifecycle_lock:

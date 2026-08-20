@@ -268,6 +268,17 @@ def parse_args():
         help="Idle seconds after the last session before auto-unloading the ASR model. Set to 0 to disable auto-unload.",
     )
     parser.add_argument(
+        "--model-unload-strategy",
+        type=str,
+        default=os.getenv("MODEL_UNLOAD_STRATEGY", "move_to_cpu"),
+        choices=["move_to_cpu", "drop"],
+        dest="model_unload_strategy",
+        help=(
+            "Model unload strategy. 'move_to_cpu' keeps faster-whisper model "
+            "files in CPU RAM; 'drop' fully drops in-memory model objects."
+        ),
+    )
+    parser.add_argument(
         "--no-vac",
         action="store_true",
         default=False,

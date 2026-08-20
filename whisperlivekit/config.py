@@ -75,6 +75,7 @@ class WhisperLiveKitConfig:
     backend: str = "auto"
     allow_dev_unload: bool = False
     model_auto_unload_timeout_seconds: float = 30.0
+    model_unload_strategy: str = "move_to_cpu"
 
     # Transcription common
     warmup_file: Optional[str] = None
@@ -213,6 +214,11 @@ class WhisperLiveKitConfig:
             self.backend_policy = "simulstreaming"
         elif self.backend_policy == "2":
             self.backend_policy = "localagreement"
+
+        if self.model_unload_strategy not in {"move_to_cpu", "drop"}:
+            raise ValueError(
+                "model_unload_strategy must be one of: move_to_cpu, drop."
+            )
 
         if self.backend == "canary":
             if not math.isfinite(self.canary_lid_min_sec) or self.canary_lid_min_sec < 0:
